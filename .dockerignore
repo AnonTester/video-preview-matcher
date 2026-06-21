@@ -1,0 +1,10 @@
+.git/
+.claude/
+.venv/
+data/
+_to_delete/
+__pycache__/
+*.pyc
+tests/
+README.md
+CHANGELOG.md

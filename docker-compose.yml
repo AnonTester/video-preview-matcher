@@ -1,0 +1,56 @@
+## Sample docker-compose.yml — copy this (or your own local override, see
+## README's "Docker deployment" section) and fill in the paths marked
+## below for your own library layout before running `docker compose up -d`.
+
+services:
+  app:
+    build: .
+    image: preview-matcher
+    container_name: preview-matcher
+    restart: unless-stopped
+    ports:
+      - "8700:8000"
+    # Optional: pass through a VAAPI-capable GPU (AMD/Intel) for
+    # `--hwaccel vaapi` decode in 02_fingerprint.py. Omit this device
+    # entirely if you don't have one, or don't want to use it —
+    # --hwaccel defaults to software decode either way.
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      # ':'-separated list of library root directories 01_inventory.py
+      # scans when no positional paths are given — see its docstring.
+      # These must be subdirectories reachable through the *single*
+      # library volume mount below (see its comment for why).
+      LIBRARY_PATHS: "/path/to/your/library/full:/path/to/your/library/previews"
+      # Override STAGE_DIR (default /data/_to_delete, see Dockerfile) so
+      # staging a file lands inside the same library mount too — same
+      # reasoning as LIBRARY_PATHS above.
+      STAGE_DIR: "/path/to/your/library/_to_delete"
+    volumes:
+      # --- Your whole library, mounted ONCE, at an identical path ---
+      # Bind-mount your library's root directory at the *same absolute
+      # path* on both sides of the colon. This single-mount-identical-
+      # path setup matters for two separate reasons:
+      #   1. DB rows store absolute paths. If you ever also run
+      #      01_inventory.py directly from a host venv (outside Docker)
+      #      against the same files, the paths it records need to match
+      #      what the container records — otherwise the same file looks
+      #      like two different ones depending on how it was last
+      #      scanned, depending on the host path.
+      #   2. Staging a file is a rename (shutil.move) — instant, no
+      #      extra disk usage — but only when source and destination are
+      #      on the same mount. Docker treats each separate `-v` line as
+      #      its own mount point, *even when* the host paths are 
+      #      subdirectories of the very same underlying filesystem.
+      #      Mounting the whole library root *once* — with LIBRARY_PATHS
+      #      and STAGE_DIR both reached as subdirectories through that
+      #      one mount — avoids this, since there's only one mount point
+      #      for the kernel to compare.
+      # Replace /path/to/your/library with your real path below (same
+      # string on both sides of the colon).
+      - /path/to/your/library:/path/to/your/library
+
+      # --- App state (SQLite DB, remux cache, subprocess log) ---
+      # Any persistent local path — doesn't need to be on the library's
+      # filesystem, and doesn't need the same-path treatment above.
+      - ./data:/data

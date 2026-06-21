@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Review — {{ preview.filename }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <div class="topbar">
+    <a class="back-link" href="/">&larr; back to queue</a>
+    <div class="brand">video #{{ preview.id }}</div>
+  </div>
+
+  <div class="review-shell">
+
+    <div class="review-meta">
+      <div>
+        <h1>{{ preview.filename }}</h1>
+        <div class="path">{{ preview.path }}</div>
+      </div>
+    </div>
+
+    {% if preview.missing_since %}
+    <div class="missing-banner">
+      This preview file was not found on disk during the last library scan
+      (moved, renamed, or deleted outside this tool). Nothing has been
+      changed automatically — review or prune it from "missing files" on
+      the queue page.
+    </div>
+    {% endif %}
+
+    {% if decision %}
+    <div class="decision-banner {{ decision.status }}">
+      <span>
+        {% if decision.status == 'staged' %}
+          Staged for deletion — moved to staging folder.
+        {% elif decision.status == 'rejected' %}
+          Marked as not a match / keep.
+        {% else %}
+          Status: {{ decision.status }}
+        {% endif %}
+      </span>
+      <button onclick="undoDecision()">undo</button>
+    </div>
+    {% endif %}
+
+    {% if candidates|length == 0 %}
+      <p>No candidate matches stored for this preview.</p>
+    {% else %}
+
+    <div class="score-panel">
+      <div class="score-item">
+        <div class="num" id="visual-score">{{ "%.0f"|format(candidates[0].visual_score * 100) }}%</div>
+        <div class="lbl">visual match</div>
+      </div>
+      <div class="score-item">
+        <div class="num" id="audio-score">{{ "%.0f"|format(candidates[0].audio_score * 100) if candidates[0].audio_score is not none else "—" }}{{ "%" if candidates[0].audio_score is not none else "" }}</div>
+        <div class="lbl">audio match</div>
+      </div>
+      <div class="score-item">
+        <div class="num" id="combined-score">{{ "%.0f"|format(candidates[0].combined_score * 100) }}%</div>
+        <div class="lbl">combined confidence</div>
+      </div>
+
+      <div class="candidate-switcher">
+        <label class="lbl" style="font-family: var(--mono); font-size: 10px; color: var(--text-faint);">candidate</label>
+        <select id="candidate-select" onchange="switchCandidate(this.value)">
+          {% for c in candidates %}
+          <option value="{{ loop.index0 }}">
+            {{ c.candidate_filename }} — {{ "%.0f"|format(c.combined_score * 100) }}%
+          </option>
+          {% endfor %}
+        </select>
+        <button class="btn dismiss" onclick="dismissCandidate()" title="Flag only this pairing as wrong — remembered, won't be suggested again">
+          dismiss candidate
+        </button>
+      </div>
+    </div>
+
+    <div class="compare-grid">
+      <div class="video-panel">
+        <div class="panel-head">
+          <span class="tag">preview (candidate for deletion)</span>
+          <span class="fname">{{ preview.filename }}</span>
+        </div>
+        <div class="panel-path">{{ preview.path }}</div>
+        <video id="preview-video" controls src="/stream/{{ preview.id }}"></video>
+        <div class="playback-warning" id="preview-playback-warning" style="display:none;"></div>
+        <div class="scene-jumps" id="preview-jumps"></div>
+      </div>
+
+      <div class="video-panel">
+        <div class="panel-head">
+          <span class="tag">matched full version</span>
+          <span class="fname" id="candidate-fname">{{ candidates[0].candidate_filename }}</span>
+        </div>
+        <div class="panel-path" id="candidate-path">{{ candidates[0].candidate_path }}</div>
+        <div class="missing-banner" id="candidate-missing-banner" style="{{ '' if candidates[0].candidate_missing_since else 'display:none;' }}">
+          This candidate file was not found on disk during the last library scan.
+        </div>
+        <video id="candidate-video" controls src="/stream/{{ candidates[0].candidate_id }}"></video>
+        <div class="playback-warning" id="candidate-playback-warning" style="display:none;"></div>
+        <div class="scene-jumps" id="candidate-jumps"></div>
+      </div>
+    </div>
+
+    <div class="match-details">
+      <div class="match-details-head">
+        <h3>Match details</h3>
+        <span class="sub" id="match-summary"></span>
+      </div>
+      <table class="match-table">
+        <thead>
+          <tr><th>#</th><th>preview ts</th><th>candidate ts</th><th>hash distance</th><th>variant</th><th></th></tr>
+        </thead>
+        <tbody id="match-table-body"></tbody>
+      </table>
+    </div>
+
+    {% endif %}
+
+    <div class="action-bar">
+      <button class="btn primary-delete" onclick="decide('approved_delete')">
+        Confirm match — stage for deletion
+      </button>
+      <button class="btn secondary" onclick="decide('rejected')">
+        Not a match — keep
+      </button>
+      <span style="color: var(--text-faint); font-size: 11px; margin-left: 8px;">
+        <kbd>D</kbd> stage &nbsp; <kbd>K</kbd> keep &nbsp; <kbd>X</kbd> dismiss candidate &nbsp; <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> candidates
+      </span>
+    </div>
+
+  </div>
+
+  <script>
+    const PREVIEW_ID = {{ preview.id }};
+    const PREVIEW_SCENE_COUNT = {{ preview_scene_count }};
+    const CANDIDATES = {{ candidates|tojson }};
+    let currentIdx = 0;
+
+    function fmtTime(s) {
+      const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+      return `${m}:${sec.toString().padStart(2,'0')}`;
+    }
+
+    function renderJumps(containerId, videoId, scenes, tsKey) {
+      const el = document.getElementById(containerId);
+      el.innerHTML = '';
+      const video = document.getElementById(videoId);
+      // de-dupe + sort by timestamp
+      const seen = new Set();
+      const uniq = scenes
+        .map(s => s[tsKey])
+        .filter(t => { const k = t.toFixed(1); if (seen.has(k)) return false; seen.add(k); return true; })
+        .sort((a,b) => a - b);
+      uniq.forEach(ts => {
+        const btn = document.createElement('button');
+        btn.textContent = fmtTime(ts);
+        btn.onclick = () => { video.currentTime = ts; video.play(); };
+        el.appendChild(btn);
+      });
+      if (uniq.length === 0) {
+        el.innerHTML = '<span style="color:var(--text-faint); font-size:11px;">no scene matches recorded</span>';
+      }
+    }
+
+    function renderMatchTable(c) {
+      const body = document.getElementById('match-table-body');
+      body.innerHTML = '';
+      const sorted = [...c.scene_matches].sort((a, b) => a.preview_ts - b.preview_ts);
+      sorted.forEach((m, i) => {
+        const tr = document.createElement('tr');
+        [String(i + 1), fmtTime(m.preview_ts), fmtTime(m.candidate_ts), String(m.distance), m.variant]
+          .forEach(text => {
+            const td = document.createElement('td');
+            td.textContent = text;
+            tr.appendChild(td);
+          });
+        const jumpTd = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.textContent = 'jump both';
+        btn.onclick = () => {
+          const pv = document.getElementById('preview-video'), cv = document.getElementById('candidate-video');
+          pv.currentTime = m.preview_ts; cv.currentTime = m.candidate_ts;
+          pv.play(); cv.play();
+        };
+        jumpTd.appendChild(btn);
+        tr.appendChild(jumpTd);
+        body.appendChild(tr);
+      });
+      if (sorted.length === 0) {
+        body.innerHTML = '<tr><td colspan="6" class="hint">no scene matches recorded</td></tr>';
+      }
+
+      let spanText = '';
+      if (sorted.length > 1) {
+        const previewTs = sorted.map(m => m.preview_ts);
+        const previewSpan = Math.max(...previewTs) - Math.min(...previewTs);
+        spanText = ` — spread across ${fmtTime(previewSpan)} of the preview`;
+      } else if (sorted.length === 1) {
+        spanText = ' — a single isolated match, not spread across multiple moments (weak evidence on its own)';
+      }
+      document.getElementById('match-summary').textContent =
+        `${c.scene_matches.length} / ${PREVIEW_SCENE_COUNT} preview scenes matched a candidate scene` +
+        `${spanText} (lower hash distance = closer match)`;
+    }
+
+    function wireVideoErrorHandling(videoId, warningId) {
+      const video = document.getElementById(videoId);
+      const warn = document.getElementById(warningId);
+      video.addEventListener('error', () => {
+        warn.style.display = '';
+        warn.textContent = "Playback failed in this browser (unsupported codec/container). " +
+          "Use the match details and scores below to decide instead.";
+      });
+      video.addEventListener('loadeddata', () => { warn.style.display = 'none'; });
+    }
+
+    function switchCandidate(idxStr) {
+      const idx = parseInt(idxStr, 10);
+      currentIdx = idx;
+      const c = CANDIDATES[idx];
+      document.getElementById('candidate-playback-warning').style.display = 'none';
+      document.getElementById('candidate-video').src = `/stream/${c.candidate_id}`;
+      document.getElementById('candidate-fname').textContent = c.candidate_filename;
+      document.getElementById('candidate-path').textContent = c.candidate_path;
+      document.getElementById('candidate-missing-banner').style.display = c.candidate_missing_since ? '' : 'none';
+      document.getElementById('visual-score').textContent = Math.round(c.visual_score * 100) + '%';
+      document.getElementById('audio-score').textContent = c.audio_score !== null ? Math.round(c.audio_score * 100) + '%' : '—';
+      document.getElementById('combined-score').textContent = Math.round(c.combined_score * 100) + '%';
+      document.getElementById('candidate-select').value = idx;
+      renderJumps('preview-jumps', 'preview-video', c.scene_matches, 'preview_ts');
+      renderJumps('candidate-jumps', 'candidate-video', c.scene_matches, 'candidate_ts');
+      renderMatchTable(c);
+    }
+
+    async function decide(status) {
+      const candidateId = CANDIDATES.length ? CANDIDATES[currentIdx].candidate_id : null;
+      const res = await fetch(`/api/decide/${PREVIEW_ID}`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({status, candidate_id: candidateId})
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
+      window.location.href = '/';
+    }
+
+    async function undoDecision() {
+      const res = await fetch(`/api/undo/${PREVIEW_ID}`, {method: 'POST'});
+      if (res.ok) window.location.reload();
+    }
+
+    function rebuildCandidateSelect() {
+      const sel = document.getElementById('candidate-select');
+      sel.innerHTML = '';
+      CANDIDATES.forEach((c, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        opt.textContent = `${c.candidate_filename} — ${Math.round(c.combined_score * 100)}%`;
+        sel.appendChild(opt);
+      });
+    }
+
+    async function dismissCandidate() {
+      if (!CANDIDATES.length) return;
+      const c = CANDIDATES[currentIdx];
+      const ok = confirm(
+        `Mark "${c.candidate_filename}" as not a match for this preview?\n\n` +
+        `This is remembered — it won't be suggested again, but other ` +
+        `candidates (and this preview's own approve/keep decision) are unaffected.`
+      );
+      if (!ok) return;
+
+      const res = await fetch(`/api/not-a-match/${PREVIEW_ID}/${c.candidate_id}`, {method: 'POST'});
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
+
+      CANDIDATES.splice(currentIdx, 1);
+      if (CANDIDATES.length === 0) {
+        window.location.href = '/';
+        return;
+      }
+      currentIdx = Math.min(currentIdx, CANDIDATES.length - 1);
+      rebuildCandidateSelect();
+      switchCandidate(currentIdx);
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+      if (e.key === 'd' || e.key === 'D') decide('approved_delete');
+      if (e.key === 'k' || e.key === 'K') decide('rejected');
+      if (e.key === 'x' || e.key === 'X') dismissCandidate();
+      if (e.key === 'ArrowRight' && currentIdx < CANDIDATES.length - 1) switchCandidate(currentIdx + 1);
+      if (e.key === 'ArrowLeft' && currentIdx > 0) switchCandidate(currentIdx - 1);
+    });
+
+    wireVideoErrorHandling('preview-video', 'preview-playback-warning');
+    wireVideoErrorHandling('candidate-video', 'candidate-playback-warning');
+
+    if (CANDIDATES.length) {
+      renderJumps('preview-jumps', 'preview-video', CANDIDATES[0].scene_matches, 'preview_ts');
+      renderJumps('candidate-jumps', 'candidate-video', CANDIDATES[0].scene_matches, 'candidate_ts');
+      renderMatchTable(CANDIDATES[0]);
+    }
+  </script>
+</body>
+</html>

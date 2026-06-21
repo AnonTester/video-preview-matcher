@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preview Matcher — Review Queue</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="brand"><b>Preview Matcher</b> <span class="version">v{{ app_version }}</span> · review console</div>
+    <div class="stats">
+      <span>videos <span class="stat-val">{{ stats.total_videos }}</span></span>
+      <span>fingerprinted <span class="stat-val">{{ stats.fingerprinted_videos }}</span></span>
+      <span>matched <span class="stat-val">{{ stats.previews_with_match }}</span></span>
+      <span>staged <span class="stat-val approved">{{ stats.staged }}</span></span>
+      <span>rejected <span class="stat-val rejected">{{ stats.rejected }}</span></span>
+    </div>
+  </div>
+
+  <div class="staging-bar">
+    <span id="staging-summary" style="display:none;"></span>
+    <button class="danger" id="staging-purge-btn" style="display:none;" onclick="purgeStaging()">empty staging folder</button>
+    <span id="missing-summary" style="display:none;"></span>
+    <button class="danger" id="missing-prune-btn" style="display:none;" onclick="pruneMissing()">prune missing files</button>
+  </div>
+
+  <div class="scan-panel">
+    <div class="scan-panel-head">
+      <h2>Library Scan</h2>
+      <span class="sub" id="scan-status-text">checking status…</span>
+    </div>
+
+    <div class="scan-controls" id="scan-controls">
+      <div class="scan-stage-select" id="scan-stage-select">
+        <label><input type="radio" name="scan-stage-mode" value="all" checked> Full pipeline</label>
+        <label><input type="radio" name="scan-stage-mode" value="inventory"> Inventory only</label>
+        <label><input type="radio" name="scan-stage-mode" value="fingerprint"> Fingerprint only</label>
+        <label><input type="radio" name="scan-stage-mode" value="match"> Match only</label>
+      </div>
+      <div class="scan-roots" id="scan-roots"><span class="hint">loading roots…</span></div>
+      <label class="scan-limit-label">
+        limit <input type="number" id="scan-limit" min="1" placeholder="none">
+        <span class="hint">(optional)</span>
+      </label>
+      <label class="scan-limit-label">
+        <input type="checkbox" id="scan-hwaccel" checked>
+        GPU decode (VAAPI)
+        <span class="hint">(fingerprinting only)</span>
+      </label>
+      <label class="scan-limit-label" id="scan-fp-workers-label">
+        fingerprint workers <input type="number" id="scan-fp-workers" min="2" placeholder="4">
+        <span class="hint">(adjustable live once running)</span>
+      </label>
+      <label class="scan-limit-label" id="scan-match-workers-label">
+        match workers <input type="number" id="scan-match-workers" min="1" placeholder="auto">
+        <span class="hint">(optional)</span>
+      </label>
+      <button class="btn primary" id="scan-start-btn" onclick="startScan()">Start scan</button>
+    </div>
+
+    <div class="scan-progress" id="scan-progress" style="display:none;">
+      <div class="scan-progress-row">
+        <span class="scan-stage" id="scan-stage-label">—</span>
+        <span class="scan-counts" id="scan-counts">0 / 0</span>
+      </div>
+      <div class="progress-bar"><div class="progress-bar-fill" id="scan-progress-fill"></div></div>
+      <div class="scan-meta">
+        <div class="scan-meta-stats">
+          <span id="scan-runtime"></span>
+          <span id="scan-eta"></span>
+        </div>
+        <div class="scan-meta-message" id="scan-message"></div>
+      </div>
+      <div class="scan-live-workers" id="scan-live-workers" style="display:none;">
+        <label>fingerprint workers
+          <input type="number" id="scan-live-workers-input" min="2">
+        </label>
+        <button class="btn secondary" onclick="applyWorkers()">Apply</button>
+        <span class="hint" id="scan-live-workers-hint"></span>
+      </div>
+      <div class="scan-actions">
+        <button class="btn secondary" id="scan-pause-btn" onclick="pauseScan()">Pause</button>
+        <button class="btn danger-outline" id="scan-cancel-btn" onclick="cancelScan()">Cancel</button>
+      </div>
+    </div>
+
+    <div class="scan-resume" id="scan-resume" style="display:none;">
+      <span id="scan-resume-text"></span>
+      <button class="btn primary" onclick="resumeScan()">Resume</button>
+    </div>
+  </div>
+
+  <div class="queue">
+    <div class="queue-header">
+      <h1>Review queue — {{ matches|length }} previews with a candidate match</h1>
+      <span class="sub">sorted by confidence, undecided first</span>
+    </div>
+
+    {% if matches|length == 0 %}
+    <div class="empty-state">
+      <div class="big">—</div>
+      <div>No matches yet.</div>
+    </div>
+    {% endif %}
+
+    {% for m in matches %}
+    {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
+    <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}">
+      <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
+      <div class="filename">
+        <span class="label">preview</span>
+        {{ m.preview_filename }}
+      </div>
+      <div class="filename">
+        <span class="label">best match</span>
+        {{ m.candidate_filename }}
+      </div>
+      <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
+      <div>
+        {% if m.decision_status == 'staged' %}
+          <div class="status-pill staged">staged</div>
+        {% elif m.decision_status == 'rejected' %}
+          <div class="status-pill rejected">rejected</div>
+        {% else %}
+          <div class="status-pill">pending</div>
+        {% endif %}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+
+  <script>
+    async function refreshStaging() {
+      const r = await fetch('/api/staging-summary');
+      const d = await r.json();
+      const summary = document.getElementById('staging-summary');
+      const btn = document.getElementById('staging-purge-btn');
+      if (d.file_count === 0) {
+        summary.style.display = 'none';
+        btn.style.display = 'none';
+        return;
+      }
+      const mb = (d.total_bytes / (1024*1024)).toFixed(0);
+      summary.style.display = '';
+      btn.style.display = '';
+      summary.textContent = `staging: ${d.file_count} files, ${mb} MB`;
+    }
+    async function purgeStaging() {
+      const r = await fetch('/api/staging-summary');
+      const d = await r.json();
+      if (d.file_count === 0) { alert('Staging folder is already empty.'); return; }
+      const ok = confirm(
+        `Permanently delete ${d.file_count} staged file(s)? This cannot be undone.\n\n` +
+        `Folder: ${d.path}`
+      );
+      if (!ok) return;
+      const res = await fetch('/api/purge-staging', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({confirm: 'DELETE'})
+      });
+      const j = await res.json();
+      alert(`Deleted ${j.deleted} file(s).`);
+      refreshStaging();
+    }
+    refreshStaging();
+
+    // ---------------------------------------------------------------------
+    // Missing files (deleted/moved/renamed outside this tool — see
+    // db.py's missing_since docstring). Listed, never auto-deleted;
+    // pruning is an explicit, confirmed action, same pattern as
+    // emptying the staging folder above.
+    // ---------------------------------------------------------------------
+
+    async function refreshMissing() {
+      const r = await fetch('/api/missing-files');
+      const d = await r.json();
+      const summary = document.getElementById('missing-summary');
+      const btn = document.getElementById('missing-prune-btn');
+      if (d.files.length === 0) {
+        summary.style.display = 'none';
+        btn.style.display = 'none';
+        return;
+      }
+      summary.style.display = '';
+      btn.style.display = '';
+      summary.textContent = `missing: ${d.files.length} file(s)`;
+    }
+
+    async function pruneMissing() {
+      const r = await fetch('/api/missing-files');
+      const d = await r.json();
+      if (d.files.length === 0) { alert('No missing files to prune.'); return; }
+      const list = d.files.slice(0, 10).map(f => `  ${f.path}`).join('\n');
+      const more = d.files.length > 10 ? `\n  ...and ${d.files.length - 10} more` : '';
+      const ok = confirm(
+        `Permanently remove ${d.files.length} missing file record(s) from the database?\n\n` +
+        `This does NOT touch any file on disk (they're already gone) — it only ` +
+        `clears their DB history (fingerprints, matches, past decisions). ` +
+        `If one of these reappears later (e.g. the mount was just temporarily ` +
+        `down), it will simply be re-discovered as a new file on the next scan.\n\n` +
+        `This cannot be undone.\n\n${list}${more}`
+      );
+      if (!ok) return;
+      const res = await fetch('/api/missing-files/prune', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({confirm: 'DELETE'})
+      });
+      const j = await res.json();
+      alert(`Removed ${j.deleted} record(s).`);
+      refreshMissing();
+    }
+    refreshMissing();
+
+    // ---------------------------------------------------------------------
+    // Library scan controls
+    // ---------------------------------------------------------------------
+
+    let SCAN_ROOTS = [];
+    let LAST_SCAN_STATUS = null;
+
+    // Set true the moment the user types into the live worker-count
+    // field, cleared only on a successful apply — deliberately not
+    // focus-based (a plain "is it focused" check still loses a typed
+    // value if focus leaves the field before the apply POST resolves,
+    // e.g. the instant you click "Apply" itself). While dirty, polling
+    // never overwrites the field, but it still has to keep refreshing
+    // the field for everyone who *hasn't* touched it — including this
+    // same scan viewed from a different device/tab, which needs to see
+    // a worker-count change made elsewhere.
+    let workersDirty = false;
+    let workersHintTimeout = null;
+
+    async function loadScanRoots() {
+      const r = await fetch('/api/scan/roots');
+      const d = await r.json();
+      SCAN_ROOTS = d.roots || [];
+      const el = document.getElementById('scan-roots');
+      if (SCAN_ROOTS.length === 0) {
+        el.innerHTML = '<span class="hint">No LIBRARY_PATHS configured.</span>';
+        return;
+      }
+      el.innerHTML = '';
+      SCAN_ROOTS.forEach((root, i) => {
+        const label = document.createElement('label');
+        label.className = 'scan-root-item';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = i;
+        cb.checked = true;
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' ' + root));
+        el.appendChild(label);
+      });
+    }
+
+    function fmtDuration(sec) {
+      if (sec == null) return '—';
+      sec = Math.max(0, Math.round(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    const STAGE_MODE_TO_STAGES = {
+      all: ['inventory', 'fingerprint', 'match'],
+      inventory: ['inventory'],
+      fingerprint: ['fingerprint'],
+      match: ['match'],
+    };
+
+    function selectedStageMode() {
+      return document.querySelector('input[name="scan-stage-mode"]:checked').value;
+    }
+
+    function updateScanControlsVisibility() {
+      const mode = selectedStageMode();
+      document.getElementById('scan-roots').style.display = (mode === 'all' || mode === 'inventory') ? '' : 'none';
+      document.getElementById('scan-limit').closest('label').style.display =
+        (mode === 'all' || mode === 'inventory' || mode === 'fingerprint') ? '' : 'none';
+      document.getElementById('scan-hwaccel').closest('label').style.display =
+        (mode === 'all' || mode === 'fingerprint') ? '' : 'none';
+      document.getElementById('scan-fp-workers-label').style.display =
+        (mode === 'all' || mode === 'fingerprint') ? '' : 'none';
+      document.getElementById('scan-match-workers-label').style.display =
+        (mode === 'all' || mode === 'match') ? '' : 'none';
+    }
+
+    async function startScan() {
+      const mode = selectedStageMode();
+      const stages = STAGE_MODE_TO_STAGES[mode];
+      const body = { stages };
+
+      if (stages.includes('inventory')) {
+        const checked = Array.from(document.querySelectorAll('#scan-roots input:checked'))
+          .map(cb => SCAN_ROOTS[parseInt(cb.value, 10)]);
+        if (checked.length === 0) { alert('Select at least one library root.'); return; }
+        body.roots = checked;
+      }
+      if (stages.includes('fingerprint')) {
+        body.hwaccel = document.getElementById('scan-hwaccel').checked ? 'vaapi' : 'none';
+        const fpWorkersVal = document.getElementById('scan-fp-workers').value;
+        if (fpWorkersVal) body.fp_workers = parseInt(fpWorkersVal, 10);
+      }
+      if (stages.includes('match')) {
+        const matchWorkersVal = document.getElementById('scan-match-workers').value;
+        if (matchWorkersVal) body.match_workers = parseInt(matchWorkersVal, 10);
+      }
+      const limitVal = document.getElementById('scan-limit').value;
+      if (limitVal) body.limit = parseInt(limitVal, 10);
+
+      const res = await fetch('/api/scan/start', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
+      pollScanStatus();
+    }
+
+    async function applyWorkers() {
+      const val = parseInt(document.getElementById('scan-live-workers-input').value, 10);
+      const hint = document.getElementById('scan-live-workers-hint');
+      const res = await fetch('/api/scan/workers', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({workers: val})
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        hint.textContent = 'Error: ' + (err.detail || res.statusText);
+        return;
+      }
+      workersDirty = false;
+      hint.textContent = 'applied — takes effect within ~2s';
+      clearTimeout(workersHintTimeout);
+      workersHintTimeout = setTimeout(() => { hint.textContent = ''; }, 2500);
+      pollScanStatus();
+    }
+
+    async function pauseScan() {
+      await fetch('/api/scan/pause', { method: 'POST' });
+      pollScanStatus();
+    }
+
+    async function cancelScan() {
+      const ok = confirm(
+        "Cancel the running scan? Progress already made is kept — already-probed " +
+        "files and already-fingerprinted videos won't be redone — but the current " +
+        "stage stops immediately."
+      );
+      if (!ok) return;
+      await fetch('/api/scan/cancel', { method: 'POST' });
+      pollScanStatus();
+    }
+
+    async function resumeScan() {
+      const res = await fetch('/api/scan/resume', { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
+      pollScanStatus();
+    }
+
+    const STAGE_LABELS = {
+      inventory: 'Inventory — probing files',
+      fingerprint: 'Fingerprinting — scene detection + hashing',
+      match: 'Matching — scoring candidate pairs',
+    };
+
+    async function pollScanStatus() {
+      const r = await fetch('/api/scan/status');
+      const d = await r.json();
+
+      // The queue list + topbar stats are server-rendered once at page
+      // load, so they go stale once a scan changes the DB underneath
+      // them. Reload as soon as a scan we were watching leaves 'running'
+      // — cheaper and more correct than re-implementing the queue/stats
+      // rendering in JS just to keep two copies in sync.
+      if (LAST_SCAN_STATUS === 'running' && d.status !== 'running') {
+        window.location.reload();
+        return;
+      }
+      LAST_SCAN_STATUS = d.status;
+
+      const controls = document.getElementById('scan-controls');
+      const progress = document.getElementById('scan-progress');
+      const resumeBox = document.getElementById('scan-resume');
+      const statusText = document.getElementById('scan-status-text');
+
+      if (d.status === 'idle') {
+        statusText.textContent = 'no scans yet';
+        controls.style.display = '';
+        progress.style.display = 'none';
+        resumeBox.style.display = 'none';
+        return;
+      }
+
+      if (d.status === 'running') {
+        statusText.textContent = 'running';
+        controls.style.display = 'none';
+        progress.style.display = '';
+        resumeBox.style.display = 'none';
+
+        document.getElementById('scan-stage-label').textContent = STAGE_LABELS[d.stage] || d.stage || '…';
+        const total = d.stage_total || 0, done = d.stage_done || 0;
+        document.getElementById('scan-counts').textContent = total ? `${done} / ${total}` : `${done}`;
+        document.getElementById('scan-progress-fill').style.width = total ? `${Math.min(100, (done / total) * 100)}%` : '0%';
+        document.getElementById('scan-message').textContent = d.message || '';
+        document.getElementById('scan-runtime').textContent = 'running for ' + fmtDuration(d.elapsed_sec);
+        const etaEl = document.getElementById('scan-eta');
+        if (d.eta_sec != null) {
+          const endTime = new Date(Date.now() + d.eta_sec * 1000);
+          const totalSec = (d.elapsed_sec || 0) + d.eta_sec;
+          etaEl.textContent = `ETA ~${fmtDuration(d.eta_sec)} remaining ` +
+            `(est. total ${fmtDuration(totalSec)}, ends ~${endTime.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})})`;
+        } else if ((d.stage_done || 0) === 0) {
+          etaEl.textContent = 'estimating… (no files finished yet this stage)';
+        } else {
+          etaEl.textContent = '';
+        }
+
+        // Live worker control only makes sense during the fingerprint
+        // stage — 02_fingerprint.py is the only stage that polls
+        // target_workers (see its module docstring). Skip touching the
+        // input's value while it's dirty (user has typed an unsubmitted
+        // edit — see workersDirty's declaration for why this is dirty-
+        // tracked rather than just focus-checked), so a pending edit
+        // isn't clobbered by the next 2s poll. When clean, always sync
+        // to the server's value — this is also what makes a worker-count
+        // change made from a *different* device/tab show up here.
+        const liveWorkers = document.getElementById('scan-live-workers');
+        const workersInput = document.getElementById('scan-live-workers-input');
+        if (d.stage === 'fingerprint') {
+          liveWorkers.style.display = '';
+          workersInput.max = d.cpu_count || 32;
+          if (!workersDirty && d.target_workers != null && String(d.target_workers) !== workersInput.value) {
+            workersInput.value = d.target_workers;
+          }
+        } else {
+          liveWorkers.style.display = 'none';
+        }
+        return;
+      }
+
+      controls.style.display = '';
+      progress.style.display = 'none';
+      statusText.textContent = `last scan: ${d.status}` + (d.message ? ' — ' + d.message : '');
+
+      if (['paused', 'interrupted', 'failed', 'cancelled'].includes(d.status)) {
+        resumeBox.style.display = '';
+        document.getElementById('scan-resume-text').textContent =
+          `Resume ${d.stage ? STAGE_LABELS[d.stage] || d.stage : 'scan'}?`;
+      } else {
+        resumeBox.style.display = 'none';
+      }
+    }
+
+    document.querySelectorAll('input[name="scan-stage-mode"]').forEach(el => {
+      el.addEventListener('change', updateScanControlsVisibility);
+    });
+    document.getElementById('scan-live-workers-input').addEventListener('input', () => {
+      workersDirty = true;
+    });
+    updateScanControlsVisibility();
+    loadScanRoots();
+    pollScanStatus();
+    setInterval(pollScanStatus, 2000);
+
+    // Browsers throttle setInterval timers in backgrounded/hidden tabs
+    // (sometimes down to once a minute or less) — without this, a scan
+    // started and then left in a background tab looks "stuck" until the
+    // tab is reloaded, even though the interval above is technically
+    // still scheduled. Force an immediate poll the moment the tab
+    // actually regains attention instead of waiting for the throttled
+    // interval to eventually catch up.
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) pollScanStatus(); });
+    window.addEventListener('focus', pollScanStatus);
+  </script>
+</body>
+</html>

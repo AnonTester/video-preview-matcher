@@ -1,0 +1,536 @@
+"""
+Tests the pure/non-subprocess pieces of the scan orchestration added to
+04_serve.py: update_scan_run() (db.py) and _build_cmd() (04_serve.py).
+Also covers queue_rows() — the query behind the "/" review queue,
+specifically its missing_since filtering (a preview or candidate not
+found on disk during the last inventory scan gets hidden from the active
+queue without anything being deleted; see db.py's missing_since
+docstring and 01_inventory.py's MISSING-FILE DETECTION section). Also
+covers _resume_plan() and _progress_with_baseline() — the fix for three
+real bugs found live in a --limit 1000 fingerprint run that got
+interrupted and resumed: a live-adjusted worker count reverting to the
+scan's original starting value, --limit overshooting the user's actual
+intended total, and progress/elapsed/ETA resetting to 0 instead of
+continuing from where the interrupted attempt left off (see
+_resume_plan()'s docstring in 04_serve.py for the full writeup).
+Doesn't spin up any subprocess, thread, or HTTP server — that part is
+exercised live (start/cancel/pause/resume against the running container),
+not here. Loads 04_serve.py directly via importlib (its filename starts
+with a digit, so it can't be `import`ed normally; this also requires
+fastapi/starlette to be installed, same as render_templates_test.py would
+if it imported 04_serve.py). Run from project root:
+
+    python3 tests/scan_orchestration_test.py
+"""
+
+import importlib.util
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from db import connect, init_db, update_scan_run  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("serve_mod", PROJECT_ROOT / "src" / "04_serve.py")
+serve_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(serve_mod)
+
+TMP_DB = Path("/tmp/scan_orchestration_test.db")
+
+
+def reset():
+    TMP_DB.unlink(missing_ok=True)
+    init_db(TMP_DB)
+
+
+def test_update_scan_run_writes_fields():
+    reset()
+    with connect(TMP_DB) as conn:
+        conn.execute(
+            "INSERT INTO scan_runs (id, params_json, status, started_at, updated_at) "
+            "VALUES (1, '{}', 'running', ?, ?)",
+            (time.time(), time.time()),
+        )
+
+    update_scan_run(TMP_DB, 1, stage="inventory", stage_total=10, stage_done=3, message="working")
+
+    with connect(TMP_DB) as conn:
+        row = conn.execute("SELECT * FROM scan_runs WHERE id = 1").fetchone()
+    assert row["stage"] == "inventory"
+    assert row["stage_total"] == 10
+    assert row["stage_done"] == 3
+    assert row["message"] == "working"
+    print("test_update_scan_run_writes_fields: OK")
+
+
+def test_update_scan_run_noop_without_run_id():
+    reset()
+    # Should not raise even though scan_runs is empty and run_id is None —
+    # a progress-reporting no-op must never be the thing that crashes a
+    # pipeline stage invoked without a --run-id (i.e. run by hand).
+    update_scan_run(TMP_DB, None, stage="inventory", stage_done=1)
+    with connect(TMP_DB) as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM scan_runs").fetchone()["n"]
+    assert count == 0
+    print("test_update_scan_run_noop_without_run_id: OK")
+
+
+def test_target_workers_column_exists_after_init_db():
+    """Migration check: target_workers was added to scan_runs after the
+    table already existed in deployed DBs, via an explicit ALTER TABLE in
+    init_db() (CREATE TABLE IF NOT EXISTS is a no-op against an existing
+    table, so the column needs its own migration step)."""
+    reset()
+    with connect(TMP_DB) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(scan_runs)")}
+    assert "target_workers" in cols
+    print("test_target_workers_column_exists_after_init_db: OK")
+
+
+def test_init_db_migration_is_idempotent():
+    """Calling init_db() again (e.g. on every process start) must not
+    raise just because target_workers already exists from a prior call."""
+    reset()
+    init_db(TMP_DB)  # second call against the already-migrated DB
+    init_db(TMP_DB)  # and a third, for good measure
+    print("test_init_db_migration_is_idempotent: OK")
+
+
+def _seed_video(conn, vid, missing_since=None, duration_sec=10.0):
+    conn.execute(
+        "INSERT INTO videos (id, path, filename, duration_sec, missing_since) VALUES (?, ?, ?, ?, ?)",
+        (vid, f"/v/{vid}.mp4", f"{vid}.mp4", duration_sec, missing_since),
+    )
+
+
+def _seed_match(conn, preview_id, candidate_id, combined_score):
+    conn.execute(
+        "INSERT INTO matches (preview_id, candidate_id, visual_score, combined_score) VALUES (?, ?, ?, ?)",
+        (preview_id, candidate_id, combined_score, combined_score),
+    )
+
+
+def test_queue_rows_includes_normal_match():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        rows = serve_mod.queue_rows(conn)
+    assert [r["preview_id"] for r in rows] == [1]
+    assert rows[0]["candidate_id"] == 2
+    print("test_queue_rows_includes_normal_match: OK")
+
+
+def test_queue_rows_excludes_missing_preview():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=123.0)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        rows = serve_mod.queue_rows(conn)
+    assert rows == [], rows
+    print("test_queue_rows_excludes_missing_preview: OK")
+
+
+def test_queue_rows_falls_back_to_second_best_when_top_candidate_missing():
+    """A preview's #1-scoring candidate vanishing shouldn't blank the
+    whole row — the next-best *non-missing* candidate should surface
+    instead."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2, missing_since=123.0)  # higher score, but missing
+        _seed_video(conn, 3)                         # lower score, present
+        _seed_match(conn, 1, 2, 0.95)
+        _seed_match(conn, 1, 3, 0.50)
+        rows = serve_mod.queue_rows(conn)
+    assert len(rows) == 1, rows
+    assert rows[0]["candidate_id"] == 3, rows[0]
+    print("test_queue_rows_falls_back_to_second_best_when_top_candidate_missing: OK")
+
+
+def test_queue_rows_excludes_preview_when_all_candidates_missing():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2, missing_since=123.0)
+        _seed_video(conn, 3, missing_since=456.0)
+        _seed_match(conn, 1, 2, 0.95)
+        _seed_match(conn, 1, 3, 0.50)
+        rows = serve_mod.queue_rows(conn)
+    assert rows == [], rows
+    print("test_queue_rows_excludes_preview_when_all_candidates_missing: OK")
+
+
+def test_build_cmd_inventory_includes_roots_and_limit():
+    cmd = serve_mod._build_cmd("01_inventory.py", 7, "/data/library.db", {"roots": ["/a", "/b"], "limit": 50})
+    assert "/a" in cmd and "/b" in cmd
+    assert "--limit" in cmd and cmd[cmd.index("--limit") + 1] == "50"
+    assert "--run-id" in cmd and cmd[cmd.index("--run-id") + 1] == "7"
+    assert "--db" in cmd and cmd[cmd.index("--db") + 1] == "/data/library.db"
+    print("test_build_cmd_inventory_includes_roots_and_limit: OK")
+
+
+def test_build_cmd_includes_debug_log_for_inventory_and_fingerprint():
+    for stage_file in ("01_inventory.py", "02_fingerprint.py"):
+        cmd = serve_mod._build_cmd(stage_file, 7, "/data/library.db", {"roots": ["/a"], "limit": None})
+        assert "--debug-log" in cmd, (stage_file, cmd)
+        assert cmd[cmd.index("--debug-log") + 1] == "/data/subprocess.log"
+    # 03_match.py doesn't shell out to ffmpeg/ffprobe, so no debug log needed
+    cmd = serve_mod._build_cmd("03_match.py", 7, "/data/library.db", {"roots": ["/a"], "limit": None})
+    assert "--debug-log" not in cmd
+    print("test_build_cmd_includes_debug_log_for_inventory_and_fingerprint: OK")
+
+
+def test_build_cmd_inventory_omits_limit_when_not_set():
+    cmd = serve_mod._build_cmd("01_inventory.py", 7, "/data/library.db", {"roots": ["/a"], "limit": None})
+    assert "--limit" not in cmd
+    print("test_build_cmd_inventory_omits_limit_when_not_set: OK")
+
+
+def test_build_cmd_match_has_no_roots_or_limit():
+    cmd = serve_mod._build_cmd("03_match.py", 7, "/data/library.db", {"roots": ["/a"], "limit": 50})
+    assert "/a" not in cmd
+    assert "--limit" not in cmd
+    print("test_build_cmd_match_has_no_roots_or_limit: OK")
+
+
+def test_build_cmd_fingerprint_includes_workers_when_set():
+    cmd = serve_mod._build_cmd("02_fingerprint.py", 7, "/data/library.db", {"fp_workers": 6})
+    assert "--workers" in cmd and cmd[cmd.index("--workers") + 1] == "6"
+    print("test_build_cmd_fingerprint_includes_workers_when_set: OK")
+
+
+def test_build_cmd_fingerprint_omits_workers_when_not_set():
+    cmd = serve_mod._build_cmd("02_fingerprint.py", 7, "/data/library.db", {})
+    assert "--workers" not in cmd
+    print("test_build_cmd_fingerprint_omits_workers_when_not_set: OK")
+
+
+def test_build_cmd_match_includes_workers_when_set():
+    cmd = serve_mod._build_cmd("03_match.py", 7, "/data/library.db", {"match_workers": 3})
+    assert "--workers" in cmd and cmd[cmd.index("--workers") + 1] == "3"
+    print("test_build_cmd_match_includes_workers_when_set: OK")
+
+
+def test_build_cmd_match_omits_workers_when_not_set():
+    cmd = serve_mod._build_cmd("03_match.py", 7, "/data/library.db", {})
+    assert "--workers" not in cmd
+    print("test_build_cmd_match_omits_workers_when_not_set: OK")
+
+
+def test_stages_from_none_runs_everything():
+    stages = serve_mod._stages_from(serve_mod.ALL_STAGES, None)
+    assert [n for n, _ in stages] == ["inventory", "fingerprint", "match"]
+    print("test_stages_from_none_runs_everything: OK")
+
+
+def test_stages_from_fingerprint_skips_inventory():
+    """The actual bug: resuming a run that was interrupted mid-fingerprint
+    used to always restart at inventory, which re-walks the library and
+    can pull in a fresh batch of new-to-probe files — crowding out the
+    specific files the fingerprint stage still had left once --limit is
+    re-applied to the now-larger backlog."""
+    stages = serve_mod._stages_from(serve_mod.ALL_STAGES, "fingerprint")
+    assert [n for n, _ in stages] == ["fingerprint", "match"]
+    print("test_stages_from_fingerprint_skips_inventory: OK")
+
+
+def test_stages_from_match_skips_inventory_and_fingerprint():
+    stages = serve_mod._stages_from(serve_mod.ALL_STAGES, "match")
+    assert [n for n, _ in stages] == ["match"]
+    print("test_stages_from_match_skips_inventory_and_fingerprint: OK")
+
+
+def test_stages_from_unknown_stage_runs_everything():
+    stages = serve_mod._stages_from(serve_mod.ALL_STAGES, "not-a-real-stage")
+    assert [n for n, _ in stages] == ["inventory", "fingerprint", "match"]
+    print("test_stages_from_unknown_stage_runs_everything: OK")
+
+
+def test_selected_stages_defaults_to_all():
+    stages = serve_mod._selected_stages({})
+    assert [n for n, _ in stages] == ["inventory", "fingerprint", "match"]
+    print("test_selected_stages_defaults_to_all: OK")
+
+
+def test_selected_stages_honors_explicit_subset():
+    stages = serve_mod._selected_stages({"stages": ["fingerprint"]})
+    assert [n for n, _ in stages] == ["fingerprint"]
+    print("test_selected_stages_honors_explicit_subset: OK")
+
+
+def test_selected_stages_keeps_canonical_order_regardless_of_input_order():
+    stages = serve_mod._selected_stages({"stages": ["match", "inventory"]})
+    assert [n for n, _ in stages] == ["inventory", "match"]
+    print("test_selected_stages_keeps_canonical_order_regardless_of_input_order: OK")
+
+
+def test_resume_skip_composes_with_stage_selection():
+    """A run that only selected ["fingerprint", "match"] and was
+    interrupted during "match" should resume at "match" only — not fall
+    back to fingerprint (already done) just because start_stage isn't
+    the first entry in ALL_STAGES."""
+    selected = serve_mod._selected_stages({"stages": ["fingerprint", "match"]})
+    resumed = serve_mod._stages_from(selected, "match")
+    assert [n for n, _ in resumed] == ["match"]
+    print("test_resume_skip_composes_with_stage_selection: OK")
+
+
+def _row(**overrides):
+    base = {
+        "params_json": '{"limit": null, "stages": ["fingerprint"]}',
+        "status": "interrupted",
+        "stage": "fingerprint",
+        "stage_total": None,
+        "stage_done": 0,
+        "stage_started_at": 1000.0,
+        "finished_at": 1100.0,
+        "target_workers": None,
+        "resume_baseline_done": 0,
+        "resume_baseline_elapsed": 0,
+        "started_at": 1000.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_resume_plan_carries_forward_live_adjusted_workers():
+    """The actual bug: /api/scan/workers only ever updates the live row's
+    target_workers, never params_json — a naive resume replaying
+    params_json unmodified silently reverts to the scan's *original*
+    starting worker count, discarding a live adjustment made mid-run."""
+    plan = serve_mod._resume_plan(_row(
+        params_json='{"limit": null, "fp_workers": null, "stages": ["fingerprint"]}',
+        target_workers=8,
+    ))
+    assert plan["params"]["fp_workers"] == 8
+    print("test_resume_plan_carries_forward_live_adjusted_workers: OK")
+
+
+def test_resume_plan_reduces_limit_by_stage_done():
+    """The actual bug: --limit applies to whatever's currently
+    outstanding, which after a partial run already excludes the
+    completed items — replaying the original --limit unmodified starts a
+    *fresh* batch of that size on top, overshooting the user's actual
+    intended total (134 done + a fresh 1000 = 1134, not 1000)."""
+    plan = serve_mod._resume_plan(_row(
+        params_json='{"limit": 1000, "stages": ["fingerprint"]}',
+        stage_done=134,
+    ))
+    assert plan["first_stage_limit"] == 866, plan["first_stage_limit"]
+    print("test_resume_plan_reduces_limit_by_stage_done: OK")
+
+
+def test_resume_plan_limit_unset_when_no_limit_in_params():
+    plan = serve_mod._resume_plan(_row(
+        params_json='{"limit": null, "stages": ["fingerprint"]}',
+        stage_done=134,
+    ))
+    assert plan["first_stage_limit"] is None
+    print("test_resume_plan_limit_unset_when_no_limit_in_params: OK")
+
+
+def test_resume_plan_limit_unset_when_nothing_done_yet():
+    # Interrupted before any progress — the original limit is still
+    # exactly right, no reduction needed.
+    plan = serve_mod._resume_plan(_row(
+        params_json='{"limit": 1000, "stages": ["fingerprint"]}',
+        stage_done=0,
+    ))
+    assert plan["first_stage_limit"] is None
+    print("test_resume_plan_limit_unset_when_nothing_done_yet: OK")
+
+
+def test_resume_plan_baseline_accumulates_across_chained_resumes():
+    """A second resume of an already-once-resumed run must carry forward
+    *both* the original attempt's progress (resume_baseline_done, from
+    the first resume) *and* the first resume's own progress before it
+    was interrupted again (stage_done) — not just the latter."""
+    plan = serve_mod._resume_plan(_row(stage_done=84, resume_baseline_done=50))
+    assert plan["baseline_done"] == 134, plan["baseline_done"]
+    print("test_resume_plan_baseline_accumulates_across_chained_resumes: OK")
+
+
+def test_resume_plan_limit_reduction_uses_cumulative_done_not_just_this_row():
+    """The actual bug this guards against: a *second* resume of an
+    already-once-resumed run computed its --limit reduction from just
+    this row's own stage_done (84), undercounting by exactly the first
+    resume's own baseline contribution (50) — letting the run overshoot
+    by 50 items. The reduction must use the full cumulative total (134),
+    same number as plan["baseline_done"]."""
+    plan = serve_mod._resume_plan(_row(
+        params_json='{"limit": 1000, "stages": ["fingerprint"]}',
+        stage_done=84, resume_baseline_done=50,
+    ))
+    assert plan["first_stage_limit"] == 1000 - 134, plan["first_stage_limit"]
+    print("test_resume_plan_limit_reduction_uses_cumulative_done_not_just_this_row: OK")
+
+
+def test_resume_plan_preserves_started_at_and_start_stage():
+    plan = serve_mod._resume_plan(_row(started_at=12345.0, stage="match"))
+    assert plan["started_at"] == 12345.0
+    assert plan["start_stage"] == "match"
+    print("test_resume_plan_preserves_started_at_and_start_stage: OK")
+
+
+def test_resume_plan_computes_baseline_elapsed_from_active_processing_time():
+    """baseline_elapsed is *active processing* time (finished_at minus
+    stage_started_at for the row being resumed from), not wall-clock
+    time since the job originally started — a long pause between
+    interruption and resume must not inflate it."""
+    plan = serve_mod._resume_plan(_row(stage_started_at=1000.0, finished_at=1090.0))
+    assert plan["baseline_elapsed"] == 90.0, plan["baseline_elapsed"]
+    print("test_resume_plan_computes_baseline_elapsed_from_active_processing_time: OK")
+
+
+def test_resume_plan_baseline_elapsed_accumulates_across_chained_resumes():
+    """Same accumulation pattern as baseline_done — a second resume must
+    add this row's own active time on top of whatever was already
+    carried into it from an even earlier resume."""
+    plan = serve_mod._resume_plan(_row(
+        stage_started_at=2000.0, finished_at=2050.0,  # 50s active this attempt
+        resume_baseline_elapsed=90.0,  # carried in from an earlier resume
+    ))
+    assert plan["baseline_elapsed"] == 140.0, plan["baseline_elapsed"]
+    print("test_resume_plan_baseline_elapsed_accumulates_across_chained_resumes: OK")
+
+
+def test_progress_with_baseline_adds_baseline_to_done_and_total():
+    """No separate "baseline total" exists — folding the same
+    baseline_done into both done and total is what reconstructs the
+    *original* intended total (12 done + 188 of this invocation's own
+    --limit-reduced total = 200, not 12 + 200 = 212)."""
+    done, total, eta = serve_mod._progress_with_baseline(
+        stage_done=188, stage_total=188, stage_started_at=1000.0,
+        baseline_done=12, baseline_elapsed=0, now=1000.0,
+    )
+    assert (done, total) == (200, 200), (done, total)
+    print("test_progress_with_baseline_adds_baseline_to_done_and_total: OK")
+
+
+def test_progress_with_baseline_eta_available_immediately_on_resume():
+    """The actual bug this guards against: right after a resume, before
+    this invocation has completed anything of its own (stage_done=0,
+    stage_elapsed=0), the old rate calculation had nothing to divide by
+    and showed no ETA at all — despite plenty of measured throughput
+    already existing from before the pause. baseline_elapsed is what
+    that rate calculation now has to work with even at stage_elapsed=0:
+    134 done over 134s of *prior* active time = 1/s, applied to the 100
+    remaining (stage_total=100) for a 100s ETA, with zero data from this
+    invocation itself yet."""
+    done, total, eta = serve_mod._progress_with_baseline(
+        stage_done=0, stage_total=100, stage_started_at=5000.0,
+        baseline_done=134, baseline_elapsed=134.0, now=5000.0,
+    )
+    assert (done, total) == (134, 234), (done, total)
+    assert eta == 100.0, eta  # 100 remaining / (134 done / 134s active = 1/s)
+    print("test_progress_with_baseline_eta_available_immediately_on_resume: OK")
+
+
+def test_progress_with_baseline_rate_blends_baseline_and_fresh_progress():
+    """As this invocation accumulates its own progress, the rate is
+    cumulative done over cumulative *active* elapsed (not wall-clock,
+    and not baseline-only or fresh-only) — 100 total done over 100s
+    total active time here, blending a 90/90s prior rate with a 10/10s
+    fresh one (both happen to be 1/s, chosen so the blended result is
+    unambiguous)."""
+    done, total, eta = serve_mod._progress_with_baseline(
+        stage_done=10, stage_total=100, stage_started_at=1000.0,
+        baseline_done=90, baseline_elapsed=90.0, now=1010.0,
+    )
+    assert (done, total) == (100, 190), (done, total)
+    assert eta == 90.0, eta  # (190-100) remaining / (100/100s = 1/s) rate
+    print("test_progress_with_baseline_rate_blends_baseline_and_fresh_progress: OK")
+
+
+def test_progress_with_baseline_no_baseline_matches_original_behavior():
+    done, total, eta = serve_mod._progress_with_baseline(
+        stage_done=50, stage_total=200, stage_started_at=1000.0,
+        baseline_done=0, baseline_elapsed=0, now=1050.0,
+    )
+    assert (done, total) == (50, 200)
+    assert eta == 150.0, eta  # (200-50) / (50/50s = 1/s)
+    print("test_progress_with_baseline_no_baseline_matches_original_behavior: OK")
+
+
+def test_progress_with_baseline_none_stage_total_passes_through():
+    done, total, eta = serve_mod._progress_with_baseline(
+        stage_done=0, stage_total=None, stage_started_at=None,
+        baseline_done=0, baseline_elapsed=0, now=100.0,
+    )
+    assert total is None
+    assert eta is None
+    print("test_progress_with_baseline_none_stage_total_passes_through: OK")
+
+
+def test_all_descendant_pids_finds_grandchildren():
+    """The actual bug this guards against: procutil.run_with_hard_timeout
+    starts ffmpeg with start_new_session=True, so it's in its own process
+    group — an upstream killpg() on the orchestrator's subprocess never
+    reaches it. _all_descendant_pids walks /proc instead, which doesn't
+    care about process-group membership. Spawns a real bash -> sleep
+    pair (sleep is bash's child, not the test's direct child) and
+    confirms the grandchild is found."""
+    proc = subprocess.Popen(["bash", "-c", "sleep 30 & wait"])
+    time.sleep(0.3)  # let bash fork its sleep child
+    try:
+        descendants = serve_mod._all_descendant_pids(proc.pid)
+        assert len(descendants) >= 1, f"expected to find the sleep grandchild, got {descendants}"
+    finally:
+        for pid in [proc.pid, *serve_mod._all_descendant_pids(proc.pid)]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait()
+    print("test_all_descendant_pids_finds_grandchildren: OK")
+
+
+if __name__ == "__main__":
+    test_update_scan_run_writes_fields()
+    test_update_scan_run_noop_without_run_id()
+    test_target_workers_column_exists_after_init_db()
+    test_init_db_migration_is_idempotent()
+    test_queue_rows_includes_normal_match()
+    test_queue_rows_excludes_missing_preview()
+    test_queue_rows_falls_back_to_second_best_when_top_candidate_missing()
+    test_queue_rows_excludes_preview_when_all_candidates_missing()
+    test_build_cmd_inventory_includes_roots_and_limit()
+    test_build_cmd_includes_debug_log_for_inventory_and_fingerprint()
+    test_build_cmd_inventory_omits_limit_when_not_set()
+    test_build_cmd_match_has_no_roots_or_limit()
+    test_build_cmd_fingerprint_includes_workers_when_set()
+    test_build_cmd_fingerprint_omits_workers_when_not_set()
+    test_build_cmd_match_includes_workers_when_set()
+    test_build_cmd_match_omits_workers_when_not_set()
+    test_stages_from_none_runs_everything()
+    test_stages_from_fingerprint_skips_inventory()
+    test_stages_from_match_skips_inventory_and_fingerprint()
+    test_stages_from_unknown_stage_runs_everything()
+    test_selected_stages_defaults_to_all()
+    test_selected_stages_honors_explicit_subset()
+    test_selected_stages_keeps_canonical_order_regardless_of_input_order()
+    test_resume_skip_composes_with_stage_selection()
+    test_resume_plan_carries_forward_live_adjusted_workers()
+    test_resume_plan_reduces_limit_by_stage_done()
+    test_resume_plan_limit_unset_when_no_limit_in_params()
+    test_resume_plan_limit_unset_when_nothing_done_yet()
+    test_resume_plan_baseline_accumulates_across_chained_resumes()
+    test_resume_plan_limit_reduction_uses_cumulative_done_not_just_this_row()
+    test_resume_plan_preserves_started_at_and_start_stage()
+    test_resume_plan_computes_baseline_elapsed_from_active_processing_time()
+    test_resume_plan_baseline_elapsed_accumulates_across_chained_resumes()
+    test_progress_with_baseline_adds_baseline_to_done_and_total()
+    test_progress_with_baseline_eta_available_immediately_on_resume()
+    test_progress_with_baseline_rate_blends_baseline_and_fresh_progress()
+    test_progress_with_baseline_no_baseline_matches_original_behavior()
+    test_progress_with_baseline_none_stage_total_passes_through()
+    test_all_descendant_pids_finds_grandchildren()
+    TMP_DB.unlink(missing_ok=True)
+    print("\nAll scan-orchestration tests passed.")

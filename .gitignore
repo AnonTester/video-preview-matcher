@@ -1,0 +1,14 @@
+.venv/
+.claude/
+__pycache__/
+data/
+_to_delete/
+
+# Project notes for Claude Code — written with real deployment details
+# (hostnames, IPs, library layout); never meant to be published.
+CLAUDE.md
+
+# Local compose override with real deployment paths/devices — see
+# rebuild.sh and README's "Docker deployment" section. docker-compose.yml
+# (the generic sample, safe to publish) stays tracked.
+docker-preview-matcher.yml
