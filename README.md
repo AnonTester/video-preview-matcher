@@ -257,6 +257,25 @@ calibrated values. Expect to spend real time here:
   splices together several moments from its source; one matching scene
   is weak, easily-coincidental evidence on its own, not confirmation.
 
+- **`--min-scene-duration`** (`03_match.py`, default `2.0` seconds): drops
+  any scene whose gap to the next scene-cut in its own video is shorter
+  than this, before scoring. Added after a real false positive (review
+  video #2237): a shared intro/logo animation got chopped by scene
+  detection into several quick cuts, all of which matched and cleared
+  `--min-matched-scenes` (3/3) — but they were all the same ~4-second
+  sting, not independent evidence. A scene this short isn't an
+  independently identifiable moment either way. 2.0s is a starting
+  point, not calibrated — raise it if real rapid-cut footage keeps
+  slipping through, lower it if legitimate short scenes are being
+  dropped.
+
+- **`--min-match-spread`** (`03_match.py`, default `2.0` seconds): skips
+  storing a match if its matched scenes' *preview* timestamps span less
+  than this many seconds — several matched scenes that are all really
+  the same narrow moment (e.g. a shared title card) aren't independent
+  corroboration just because there happen to be `--min-matched-scenes`
+  of them. Same starting-point caveat as `--min-scene-duration` above.
+
 - **Audio scoring** (`chromaprint_similarity` in `03_match.py`): shipped
   as a deliberately simple bit-overlap comparator, explicitly flagged in
   its docstring as a placeholder. Since previews here may have narration
@@ -323,13 +342,16 @@ from a phone without it just rendering a zoomed-out desktop page.
   player to a matched scene timestamp. Switch between candidates (if a
   preview matched more than one full video) via dropdown or `←`/`→`. A
   "Match details" table below the players lists every matched scene's
-  hash distance, both timestamps, and crop/flip variant, plus a summary
+  hash distance, both timestamps, each side's scene duration (gap to its
+  own next scene-cut — short durations on both sides are exactly the
+  shared-intro/logo false-positive pattern that `--min-scene-duration`
+  guards against, see "Tuning"), and crop/flip variant, plus a summary
   line stating whether the matches spread across multiple distinct
   moments in the preview or are a single isolated point (a single match
   is weak, coincidental-prone evidence — see "Tuning" →
-  `--min-matched-scenes`) — useful for judging a match even when (or
-  especially when) playback isn't available, and for spotting a
-  confidently-wrong match before trusting it.
+  `--min-matched-scenes`/`--min-match-spread`) — useful for judging a
+  match even when (or especially when) playback isn't available, and for
+  spotting a confidently-wrong match before trusting it.
 - If a file fails to play in-browser, you'll see an inline message
   instead of a silent failure (most real causes — like the broken-codec-tag
   issue below — are auto-fixed transparently and shouldn't trigger this).

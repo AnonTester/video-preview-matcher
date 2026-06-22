@@ -37,6 +37,33 @@ MINIMUM MATCHED-SCENE COUNT (--min-matched-scenes, default 3):
     --hash-threshold 12 -> 8 (all three false positives sat exactly at the
     old boundary) and --min-matched-scenes added at 3.
 
+MINIMUM SCENE DURATION (--min-scene-duration, default 2.0s) AND MATCH
+SPREAD (--min-match-spread, default 2.0s):
+    A second, distinct false-positive class found via real review (video
+    #2237): a preview and an unrelated candidate both opened with the same
+    shared intro/logo animation, which ffmpeg's scene detection chopped
+    into several quick cuts within ~2 seconds. All of them matched (hash
+    distance 0, 0, 2) and cleared --min-matched-scenes (3/3) — but all
+    three were the same ~4-second intro, not three independent
+    corroborating moments. --min-matched-scenes guards against a single
+    coincidental hit; it does nothing against several hits that are all
+    really the same hit.
+    --min-scene-duration drops any scene whose gap to the *next*
+    scene-cut in its own video is below this threshold before scoring —
+    a logo sting's rapid-fire cuts aren't independently identifiable
+    scenes and shouldn't count as (or dilute/inflate) evidence either
+    way. Applied once in load_all_scenes() to both sides of every pair
+    (a video can be someone else's candidate), not per-pair. A scene with
+    no next cut (the last one in its video) has no known duration and is
+    always kept rather than guessed at.
+    --min-match-spread independently requires the matched scenes'
+    *preview* timestamps to span at least this many seconds — guards
+    against scenes that individually pass the duration floor but still
+    all land within the same narrow moment (e.g. a longer single shared
+    title card). Both are starting points (2.0s), not calibrated values —
+    tune with real false positives/negatives in hand, same as
+    --hash-threshold's history above.
+
 AUDIO SCORE:
     Chromaprint fingerprints are compared only when both sides have one
     (fp_ok=1). A previewer with narration dubbed over the original audio
@@ -103,6 +130,7 @@ Usage:
                              [--color-threshold 0.25] [--min-ratio 0.02]
                              [--max-ratio 0.95] [--top-n 5]
                              [--min-visual-score 0.15] [--min-matched-scenes 3]
+                             [--min-scene-duration 2.0] [--min-match-spread 2.0]
                              [--workers N]
 """
 
@@ -128,25 +156,43 @@ def load_dismissed_pairs(conn) -> set[tuple[int, int]]:
     return {(r["preview_id"], r["candidate_id"]) for r in rows}
 
 
-def load_all_scenes(conn) -> dict[int, list[dict]]:
+def load_all_scenes(conn, min_scene_duration: float = 0.0) -> dict[int, list[dict]]:
     """Every video's scenes, preloaded once — see module docstring's
     PERFORMANCE section for why this replaced a per-pair, per-side
     `SELECT`. Hashes are parsed from hex to int here, once, so the
     comparison loop never re-parses the same string across the many pairs
-    that share a video."""
+    that share a video.
+
+    Each scene also gets `duration_to_next` (gap to the next scene-cut in
+    the same video, by `scene_index` order; None for a video's last scene
+    — its true duration isn't knowable from `scenes` alone, see module
+    docstring). Scenes with a known duration below `min_scene_duration`
+    are dropped entirely (not just down-weighted) before any pair is
+    scored — see module docstring's MINIMUM SCENE DURATION section."""
     rows = conn.execute(
         "SELECT video_id, scene_index, timestamp_sec, phash, phash_cropped, phash_flipped, color_sig "
         "FROM scenes ORDER BY video_id, scene_index"
     ).fetchall()
-    by_video: dict[int, list[dict]] = {}
+    raw_by_video: dict[int, list[dict]] = {}
     for r in rows:
-        by_video.setdefault(r["video_id"], []).append({
+        raw_by_video.setdefault(r["video_id"], []).append({
             "timestamp_sec": r["timestamp_sec"],
             "phash": int(r["phash"], 16),
             "phash_cropped": int(r["phash_cropped"], 16),
             "phash_flipped": int(r["phash_flipped"], 16),
             "color_sig": r["color_sig"],
         })
+
+    by_video: dict[int, list[dict]] = {}
+    for video_id, scenes in raw_by_video.items():
+        kept = []
+        for i, s in enumerate(scenes):
+            duration = scenes[i + 1]["timestamp_sec"] - s["timestamp_sec"] if i + 1 < len(scenes) else None
+            if duration is not None and duration < min_scene_duration:
+                continue
+            s["duration_to_next"] = duration
+            kept.append(s)
+        by_video[video_id] = kept
     return by_video
 
 
@@ -160,17 +206,18 @@ def load_all_audio(conn) -> dict[int, dict]:
 def best_scene_match(preview_scene, candidate_scenes, hash_threshold, color_threshold):
     """
     Compare one preview scene against every candidate scene across all
-    crop/flip variant combinations. Returns (best_distance, candidate_ts,
-    variant_label) or None if nothing clears the threshold. Hashes are
-    already ints (see load_all_scenes) — XOR + int.bit_count() is the
-    popcount, faster than bin(x).count("1") and avoids re-parsing hex.
+    crop/flip variant combinations. Returns a dict (distance, candidate_ts,
+    variant, preview_ts, preview_scene_duration, candidate_scene_duration)
+    or None if nothing clears the threshold. Hashes are already ints (see
+    load_all_scenes) — XOR + int.bit_count() is the popcount, faster than
+    bin(x).count("1") and avoids re-parsing hex.
     """
     p_variants = (
         ("normal", preview_scene["phash"]),
         ("cropped", preview_scene["phash_cropped"]),
         ("flipped", preview_scene["phash_flipped"]),
     )
-    best = None  # (distance, candidate_ts, "p_variant-vs-c_variant", c_color_sig)
+    best = None  # (distance, candidate_ts, candidate_duration, "p_variant-vs-c_variant", c_color_sig)
 
     for c_scene in candidate_scenes:
         c_variants = (
@@ -182,12 +229,13 @@ def best_scene_match(preview_scene, candidate_scenes, hash_threshold, color_thre
             for c_label, c_hash in c_variants:
                 dist = (p_hash ^ c_hash).bit_count()
                 if best is None or dist < best[0]:
-                    best = (dist, c_scene["timestamp_sec"], f"{p_label}-vs-{c_label}", c_scene["color_sig"])
+                    best = (dist, c_scene["timestamp_sec"], c_scene.get("duration_to_next"),
+                             f"{p_label}-vs-{c_label}", c_scene["color_sig"])
 
     if best is None:
         return None
 
-    dist, c_ts, variant, c_color_sig = best
+    dist, c_ts, c_duration, variant, c_color_sig = best
     if dist > hash_threshold:
         return None
 
@@ -197,7 +245,12 @@ def best_scene_match(preview_scene, candidate_scenes, hash_threshold, color_thre
     if c_dist > color_threshold:
         return None
 
-    return {"distance": dist, "candidate_ts": c_ts, "variant": variant, "preview_ts": preview_scene["timestamp_sec"]}
+    return {
+        "distance": dist, "candidate_ts": c_ts, "variant": variant,
+        "preview_ts": preview_scene["timestamp_sec"],
+        "preview_scene_duration": preview_scene.get("duration_to_next"),
+        "candidate_scene_duration": c_duration,
+    }
 
 
 def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_threshold, color_threshold):
@@ -218,6 +271,15 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
 
     visual_score = len(matched) / len(preview_scenes)
 
+    # How much of the preview's own timeline the matched scenes actually
+    # span — see module docstring's MATCH SPREAD section. 0.0 for a single
+    # match (nothing to spread across), not None, so it composes cleanly
+    # with a >= threshold check in the caller.
+    match_spread_sec = (
+        max(m["preview_ts"] for m in matched) - min(m["preview_ts"] for m in matched)
+        if len(matched) > 1 else 0.0
+    )
+
     # Audio score (only if both sides have a usable fingerprint)
     audio_score = None
     p_audio = audio_by_video.get(preview_id)
@@ -235,6 +297,7 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
         "audio_score": audio_score,
         "combined_score": combined,
         "scene_matches": matched,
+        "match_spread_sec": match_spread_sec,
     }
 
 
@@ -318,6 +381,14 @@ def main():
     ap.add_argument("--min-matched-scenes", type=int, default=3,
                      help="skip storing matches with fewer than this many matched scenes — a high *fraction* "
                           "from a tiny sample (e.g. 1/2) is weak, coincidental evidence; see module docstring")
+    ap.add_argument("--min-scene-duration", type=float, default=2.0,
+                     help="drop scenes shorter than this (seconds, gap to the next scene-cut in their own "
+                          "video) before scoring — a rapid-cut intro/logo sting isn't an independently "
+                          "identifiable scene; see module docstring's MINIMUM SCENE DURATION section")
+    ap.add_argument("--min-match-spread", type=float, default=2.0,
+                     help="skip storing matches whose matched scenes' preview timestamps span less than this "
+                          "many seconds — several hits clustered in the same narrow moment aren't independent "
+                          "corroboration; see module docstring's MATCH SPREAD section")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
                      help="parallel scoring processes (pure CPU-bound, no I/O contention — unlike "
                           "02_fingerprint.py's --workers, more cores should mostly just help here, but "
@@ -337,7 +408,7 @@ def main():
             "SELECT id, path, filename, duration_sec FROM videos WHERE fingerprinted_at IS NOT NULL"
         ).fetchall()
         dismissed = load_dismissed_pairs(conn)
-        scenes_by_video = load_all_scenes(conn)
+        scenes_by_video = load_all_scenes(conn, min_scene_duration=args.min_scene_duration)
         audio_by_video = load_all_audio(conn)
 
     if not videos:
@@ -365,10 +436,10 @@ def main():
             if args.min_ratio <= ratio <= args.max_ratio:
                 pairs.append((p["id"], c["id"]))
 
-    print(f"{len(pairs)} candidate pairs after duration prefilter (out of {len(videos)*(len(videos)-1)} possible)")
+    print(f"{len(pairs):,} candidate pairs after duration prefilter (out of {len(videos)*(len(videos)-1):,} possible)")
     print(f"Scoring with {args.workers} worker{'s' if args.workers != 1 else ''}.")
     update_scan_run(args.db, args.run_id, stage="match", stage_total=len(pairs), stage_done=0,
-                     stage_started_at=time.time(), message=f"{len(pairs)} candidate pairs",
+                     stage_started_at=time.time(), message=f"{len(pairs):,} candidate pairs",
                      updated_at=time.time())
 
     results_by_preview = {}
@@ -379,13 +450,14 @@ def main():
         for i, (preview_id, candidate_id) in enumerate(pairs, 1):
             res = score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, args.hash_threshold, args.color_threshold)
             if (res and res["visual_score"] >= args.min_visual_score
-                    and len(res["scene_matches"]) >= args.min_matched_scenes):
+                    and len(res["scene_matches"]) >= args.min_matched_scenes
+                    and res["match_spread_sec"] >= args.min_match_spread):
                 results_by_preview.setdefault(preview_id, []).append((candidate_id, res))
 
             if i % 500 == 0:
-                print(f"  ...{i}/{len(pairs)} pairs scored ({(time.time()-t0):.1f}s elapsed)")
+                print(f"  ...{i:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
                 update_scan_run(args.db, args.run_id, stage_done=i,
-                                 message=f"{i}/{len(pairs)} pairs scored", updated_at=time.time())
+                                 message=f"{i:,}/{len(pairs):,} pairs scored", updated_at=time.time())
         done_pairs = len(pairs)
     else:
         chunks = _chunk_pairs(pairs, args.workers)
@@ -397,12 +469,13 @@ def main():
             for fut in as_completed(futures):
                 for preview_id, candidate_id, res in fut.result():
                     if (res and res["visual_score"] >= args.min_visual_score
-                            and len(res["scene_matches"]) >= args.min_matched_scenes):
+                            and len(res["scene_matches"]) >= args.min_matched_scenes
+                            and res["match_spread_sec"] >= args.min_match_spread):
                         results_by_preview.setdefault(preview_id, []).append((candidate_id, res))
                 done_pairs += futures[fut]
-                print(f"  ...{done_pairs}/{len(pairs)} pairs scored ({(time.time()-t0):.1f}s elapsed)")
+                print(f"  ...{done_pairs:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
                 update_scan_run(args.db, args.run_id, stage_done=done_pairs,
-                                 message=f"{done_pairs}/{len(pairs)} pairs scored", updated_at=time.time())
+                                 message=f"{done_pairs:,}/{len(pairs):,} pairs scored", updated_at=time.time())
 
     with connect(args.db) as conn:
         # Keep only top-N per preview, write to matches table

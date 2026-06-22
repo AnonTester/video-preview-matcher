@@ -77,9 +77,60 @@ def test_load_all_audio_groups_by_video():
     print("test_load_all_audio_groups_by_video: OK")
 
 
-def _scene(ts, phash_hex, color_sig="00"):
+def _scene(ts, phash_hex, color_sig="00", duration_to_next=None):
     h = int(phash_hex, 16)
-    return {"timestamp_sec": ts, "phash": h, "phash_cropped": h, "phash_flipped": h, "color_sig": color_sig}
+    return {"timestamp_sec": ts, "phash": h, "phash_cropped": h, "phash_flipped": h,
+            "color_sig": color_sig, "duration_to_next": duration_to_next}
+
+
+def _insert_scene(conn, video_id, scene_index, ts, phash_hex="ff00"):
+    conn.execute(
+        "INSERT INTO scenes (video_id, scene_index, timestamp_sec, phash, phash_cropped, phash_flipped, color_sig) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (video_id, scene_index, ts, phash_hex, phash_hex, phash_hex, "00"),
+    )
+
+
+def test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none():
+    reset()
+    with connect(TMP_DB) as conn:
+        conn.execute("INSERT INTO videos (id, path, filename) VALUES (1, '/a.mp4', 'a.mp4')")
+        _insert_scene(conn, 1, 0, 0.0)
+        _insert_scene(conn, 1, 1, 2.0)
+        _insert_scene(conn, 1, 2, 5.0)
+
+    with connect(TMP_DB) as conn:
+        by_video = match_mod.load_all_scenes(conn)  # min_scene_duration=0.0 default, nothing dropped
+
+    durations = [s["duration_to_next"] for s in by_video[1]]
+    assert durations == [2.0, 3.0, None]
+    print("test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none: OK")
+
+
+def test_load_all_scenes_drops_scenes_shorter_than_min_duration():
+    # Mimics video #2237's rapid-cut intro: three quick cuts (gaps of 1s)
+    # followed by a genuine longer scene. Only the long scene plus the
+    # undated last scene should survive a 2.0s floor.
+    reset()
+    with connect(TMP_DB) as conn:
+        conn.execute("INSERT INTO videos (id, path, filename) VALUES (1, '/a.mp4', 'a.mp4')")
+        _insert_scene(conn, 1, 0, 0.0)
+        _insert_scene(conn, 1, 1, 1.0)
+        _insert_scene(conn, 1, 2, 2.0)
+        _insert_scene(conn, 1, 3, 10.0)
+        _insert_scene(conn, 1, 4, 20.0)
+
+    with connect(TMP_DB) as conn:
+        by_video = match_mod.load_all_scenes(conn, min_scene_duration=2.0)
+
+    # ts=0.0 (duration 1.0) and ts=1.0 (duration 1.0) are dropped — their
+    # own gap to the next cut is under the floor. ts=2.0 survives despite
+    # being close to the dropped pair, since *its* forward gap (to 10.0)
+    # is 8s — duration is about each scene's own span, not proximity to
+    # neighbors.
+    kept_ts = [s["timestamp_sec"] for s in by_video[1]]
+    assert kept_ts == [2.0, 10.0, 20.0], kept_ts
+    print("test_load_all_scenes_drops_scenes_shorter_than_min_duration: OK")
 
 
 def test_best_scene_match_finds_identical_hash_at_zero_distance():
@@ -101,6 +152,15 @@ def test_best_scene_match_rejects_over_threshold():
     print("test_best_scene_match_rejects_over_threshold: OK")
 
 
+def test_best_scene_match_carries_scene_durations_through():
+    preview_scene = _scene(1.0, "ff00ff00ff00ff00", duration_to_next=4.0)
+    candidate_scenes = [_scene(5.0, "ff00ff00ff00ff00", duration_to_next=6.0)]
+    m = match_mod.best_scene_match(preview_scene, candidate_scenes, hash_threshold=8, color_threshold=0.25)
+    assert m["preview_scene_duration"] == 4.0
+    assert m["candidate_scene_duration"] == 6.0
+    print("test_best_scene_match_carries_scene_durations_through: OK")
+
+
 def test_score_pair_missing_scenes_returns_none():
     res = match_mod.score_pair({}, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert res is None
@@ -118,7 +178,32 @@ def test_score_pair_perfect_visual_match_no_audio():
     assert res["audio_score"] is None
     assert res["combined_score"] == 1.0  # no audio -> combined == visual, no penalty
     assert len(res["scene_matches"]) == 3
+    assert res["match_spread_sec"] == 2.0  # preview_ts 1.0..3.0
     print("test_score_pair_perfect_visual_match_no_audio: OK")
+
+
+def test_score_pair_single_match_has_zero_spread():
+    scenes_by_video = {
+        1: [_scene(1.0, "ff00ff00ff00ff00")],
+        2: [_scene(10.0, "ff00ff00ff00ff00")],
+    }
+    res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    assert res["match_spread_sec"] == 0.0
+    print("test_score_pair_single_match_has_zero_spread: OK")
+
+
+def test_score_pair_clustered_matches_have_small_spread():
+    # video #2237 in miniature: three preview scenes within ~2s of each
+    # other (a rapid-cut intro) all matching — weak corroboration even
+    # though the raw matched-scene count clears --min-matched-scenes.
+    scenes_by_video = {
+        1: [_scene(0.2, "ff00ff00ff00ff00"), _scene(1.0, "00ff00ff00ff00ff"), _scene(1.8, "ffff0000ffff0000")],
+        2: [_scene(0.1, "ff00ff00ff00ff00"), _scene(0.9, "00ff00ff00ff00ff"), _scene(1.7, "ffff0000ffff0000")],
+    }
+    res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    assert len(res["scene_matches"]) == 3
+    assert res["match_spread_sec"] == 1.6  # 1.8 - 0.2
+    print("test_score_pair_clustered_matches_have_small_spread: OK")
 
 
 def test_chunk_pairs_empty_list():
@@ -147,11 +232,16 @@ def test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing():
 if __name__ == "__main__":
     test_load_all_scenes_parses_hex_to_int_and_groups_by_video()
     test_load_all_scenes_empty_table_returns_empty_dict()
+    test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none()
+    test_load_all_scenes_drops_scenes_shorter_than_min_duration()
     test_load_all_audio_groups_by_video()
     test_best_scene_match_finds_identical_hash_at_zero_distance()
     test_best_scene_match_rejects_over_threshold()
+    test_best_scene_match_carries_scene_durations_through()
     test_score_pair_missing_scenes_returns_none()
     test_score_pair_perfect_visual_match_no_audio()
+    test_score_pair_single_match_has_zero_spread()
+    test_score_pair_clustered_matches_have_small_spread()
     test_chunk_pairs_empty_list()
     test_chunk_pairs_covers_every_pair_exactly_once_in_order()
     test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing()

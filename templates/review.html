@@ -113,7 +113,7 @@
       </div>
       <table class="match-table">
         <thead>
-          <tr><th>#</th><th>preview ts</th><th>candidate ts</th><th>hash distance</th><th>variant</th><th></th></tr>
+          <tr><th>#</th><th>preview ts</th><th>preview len</th><th>candidate ts</th><th>candidate len</th><th>hash distance</th><th>variant</th><th></th></tr>
         </thead>
         <tbody id="match-table-body"></tbody>
       </table>
@@ -146,6 +146,12 @@
       return `${m}:${sec.toString().padStart(2,'0')}`;
     }
 
+    function fmtDur(s) {
+      // null = last scene in its video, true duration unknown — see
+      // 03_match.py's load_all_scenes() docstring.
+      return (s == null) ? '—' : `${s.toFixed(1)}s`;
+    }
+
     function renderJumps(containerId, videoId, scenes, tsKey) {
       const el = document.getElementById(containerId);
       el.innerHTML = '';
@@ -173,7 +179,8 @@
       const sorted = [...c.scene_matches].sort((a, b) => a.preview_ts - b.preview_ts);
       sorted.forEach((m, i) => {
         const tr = document.createElement('tr');
-        [String(i + 1), fmtTime(m.preview_ts), fmtTime(m.candidate_ts), String(m.distance), m.variant]
+        [String(i + 1), fmtTime(m.preview_ts), fmtDur(m.preview_scene_duration),
+         fmtTime(m.candidate_ts), fmtDur(m.candidate_scene_duration), String(m.distance), m.variant]
           .forEach(text => {
             const td = document.createElement('td');
             td.textContent = text;
@@ -192,7 +199,7 @@
         body.appendChild(tr);
       });
       if (sorted.length === 0) {
-        body.innerHTML = '<tr><td colspan="6" class="hint">no scene matches recorded</td></tr>';
+        body.innerHTML = '<tr><td colspan="8" class="hint">no scene matches recorded</td></tr>';
       }
 
       let spanText = '';

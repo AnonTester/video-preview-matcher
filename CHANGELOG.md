@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-06-22 — 0.11.0
+
+- **New false-positive class, found via real review (video #2237)**: a
+  preview and an unrelated candidate both opened with the same shared
+  intro/logo animation. Scene detection chopped it into three quick cuts
+  within ~2 seconds, all of which matched (hash distance 0, 0, 2) and
+  cleared `--min-matched-scenes` (3/3) — but all three were the same
+  ~4-second sting, not three independent corroborating moments.
+  `--min-matched-scenes` guards against one coincidental hit; it did
+  nothing against several hits that are really the same hit.
+- **Added `--min-scene-duration` (`03_match.py`, default `2.0`s)**: drops
+  any scene whose gap to the next scene-cut in its own video is shorter
+  than this, before scoring — applied to both sides of every pair via
+  `load_all_scenes()`, since a video can be someone else's candidate. A
+  rapid-cut logo sting isn't an independently identifiable scene.
+- **Added `--min-match-spread` (`03_match.py`, default `2.0`s)**: skips
+  storing a match whose matched scenes' *preview* timestamps span less
+  than this many seconds — guards against scenes that individually pass
+  the duration floor but still all land within the same narrow moment
+  (e.g. a longer single shared title card). Both new thresholds are
+  starting points, not calibrated values.
+- **Match details table now shows each matched scene's duration** (gap
+  to its own next scene-cut, on both the preview and candidate side, "—"
+  when unknown/last-scene) — this is exactly the information that had to
+  be inferred by hand to diagnose video #2237's false positive.
+- **Scoring progress display now uses thousand-separators** for
+  candidate-pair counts (console output, the scan panel's live "done /
+  total" counter, and `scan_runs.message`) — the match stage's pair
+  count is routinely in the hundreds of thousands to millions and was
+  unreadable as a bare digit string.
+
 ## 2026-06-21 — 0.10.6
 
 - **Fix (real bug in production, found via user review of the 0.10.5

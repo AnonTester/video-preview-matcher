@@ -408,7 +408,8 @@
 
         document.getElementById('scan-stage-label').textContent = STAGE_LABELS[d.stage] || d.stage || '…';
         const total = d.stage_total || 0, done = d.stage_done || 0;
-        document.getElementById('scan-counts').textContent = total ? `${done} / ${total}` : `${done}`;
+        document.getElementById('scan-counts').textContent = total
+          ? `${done.toLocaleString()} / ${total.toLocaleString()}` : `${done.toLocaleString()}`;
         document.getElementById('scan-progress-fill').style.width = total ? `${Math.min(100, (done / total) * 100)}%` : '0%';
         document.getElementById('scan-message').textContent = d.message || '';
         document.getElementById('scan-runtime').textContent = 'running for ' + fmtDuration(d.elapsed_sec);
