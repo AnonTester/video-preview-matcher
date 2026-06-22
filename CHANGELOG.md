@@ -1,5 +1,131 @@
 # Changelog
 
+## 2026-06-22 — 0.12.1
+
+- **Added `--progress-interval`** (`03_match.py`, default 10.0 seconds,
+  `--workers > 1` only): `_chunk_pairs`'s chunk count was fixed at
+  `workers * 4` (floored at 40) regardless of pair count — fine for a
+  small test run, but means a real full-library run's chunks grow in
+  lockstep with pair count, so progress updates land only every few
+  minutes once there are millions of pairs. Now additionally scales
+  chunk count up so each chunk represents roughly `--progress-interval`
+  seconds of one worker's time, via a rough throughput estimate
+  (`PAIRS_PER_WORKER_SEC`, documented in `_chunk_pairs`'s docstring as
+  derived from the one pre-vectorization benchmark on record — likely
+  conservative now, expect updates to land sooner than requested rather
+  than later). Never lowers chunk count below the existing
+  `workers*4`/40 floor, so small runs are unaffected.
+
+## 2026-06-22 — 0.12.0
+
+- **Rewrote 03_match.py's scene comparison to be numpy-vectorized**
+  (`VideoScenes`/`score_scenes`, replacing the old per-scene Python-dict
+  list and nested-loop `best_scene_match`), as the most likely real fix
+  for 0.11.2's incident — not just a speedup. Two distinct problems, one
+  fix:
+  - **Memory footprint**: a 64-bit hash as a Python int is 36 bytes
+    (measured via `sys.getsizeof`); a bare per-scene dict shell is ~270
+    bytes before any of its values. Packed into columnar numpy arrays
+    (`uint64` hashes, `float64` timestamps, `uint8` color-histogram
+    signatures), the same data is roughly an order of magnitude smaller.
+  - **The actual likely cause of the crash**: `ProcessPoolExecutor`'s
+    `initargs` hands every forked worker the same preloaded scene data.
+    Linux `fork()` normally shares pages copy-on-write, but CPython's
+    refcounting touches every object's refcount on *any* read, which
+    dirties the page and forces a private copy — with a Python
+    dict-of-dicts, every hash/timestamp lookup during scoring is exactly
+    such a touch, so each worker's RSS creeps up gradually over a run as
+    it touches more of the preloaded data. This fits 0.11.2's incident
+    (crashed at ~77% progress, not at the start) far better than the
+    chunking bug fixed in 0.11.2, which spikes once, upfront. A
+    vectorized numpy op reads the raw buffer in C without creating a
+    Python object per element, so it never touches a per-hash refcount —
+    those pages stay genuinely shared across forked workers for the
+    buffer's whole lifetime.
+  - `score_scenes()` also computes the full (n_preview, n_candidate, 3, 3)
+    Hamming-distance tensor for an entire pair in a handful of numpy
+    calls instead of n_preview * n_candidate * 9 individual Python-level
+    comparisons — a real speedup, but secondary to the above.
+  - Tie-breaking (which candidate scene/variant combo wins when several
+    are equally close) is bit-for-bit identical to the old "first
+    strictly-lower distance wins" rule — verified against the old
+    implementation across thousands of randomized trials with
+    deliberately-induced ties before it was replaced, and `--workers 1`
+    vs `--workers 3` against identical seeded DBs re-confirmed
+    byte-identical output afterward (same values as before this change,
+    not just internally consistent with each other).
+  - Requires `numpy>=2.0.0` now (bumped from `>=1.26.0` in
+    requirements.txt) for `np.bitwise_count`, the vectorized popcount.
+  - **Not yet validated**: this against a real multi-minute match run on
+    the actual ~5000-video library with RSS watched live over the whole
+    run — the synthetic tests here confirm correctness and the
+    fork-sharing *mechanism*, not that the production incident is fully
+    resolved. Recommended next step before trusting a full `--workers`
+    cores-1 run again: a smaller/`--limit`-bounded run with `free -m`/
+    `docker stats` watched throughout.
+
+## 2026-06-22 — 0.11.2
+
+- **Incident**: running a match-only scan (5000 videos, ~11.7M pairs,
+  `--workers` auto = 15) ran fine on all 15 cores for ~12 minutes, then
+  workers started dying off, load average hit 76, and the server became
+  unresponsive to SSH (still answered ping) with `kswapd0` pegged and
+  swap fully used — required a hard reboot. Kernel logs showed an
+  amdgpu VCN fault; other ffmpeg/GPU work was running concurrently, so
+  that specific fault isn't confidently attributable to this stage
+  (03_match.py touches no GPU/ffmpeg at all). What *is* attributable:
+  - **Fixed real bug**: 0.11.1's cost-aware chunking (`_chunk_pairs`)
+    sorted a `(cost, preview_id, candidate_id)` copy of every pair
+    before bin-packing — at ~11.7M pairs, ~2.5-3GB of purely transient
+    allocation that didn't exist before 0.11.1, on a system already
+    reporting ~0 free RAM and fully-used swap. Rewritten to bin-pack in
+    arrival order instead (no sort, no per-pair allocation beyond what
+    plain equal-count slicing already needed) — see `_chunk_pairs`'s
+    docstring for the full reasoning on why dropping the sort doesn't
+    meaningfully weaken the load-balancing fix.
+  - **However**: the crash happened at ~77% progress (9M/11.7M pairs),
+    not at the start — the chunking spike happens once, upfront, before
+    any pairs are scored, so it doesn't fully explain a failure that far
+    in. The more likely primary driver is pre-existing and not
+    introduced by 0.11.1: `ProcessPoolExecutor`'s `initargs` hands all
+    15 forked workers the same preloaded `scenes_by_video`/`audio_by_video`
+    dicts, and CPython's refcounting touches every object's refcount on
+    any read, defeating `fork()`'s copy-on-write sharing — so each
+    worker's RSS can creep up over the run as it touches more of the
+    preloaded data, not just at startup. This wasn't exercised at
+    today's ~5000-video scale before (last validated around 2000
+    videos). Documented in README's `--workers` tuning entry: don't
+    assume `cpu_count - 1` is RAM-safe at large library sizes without
+    watching actual memory over a real run.
+  - Progress display wording fixed: the match stage's "estimating…"
+    message said "no files finished yet this stage" — it's pairs, not
+    files, during matching. Now stage-aware (`STAGE_UNITS`).
+
+## 2026-06-22 — 0.11.1
+
+- **Fix (found live on homeserver, 16 cores, `--workers` auto)**: the
+  match stage's running worker count visibly drained over the course of
+  a real run, well before the run finished — most chunks completed
+  quickly while a couple of workers kept grinding alone, leaving the
+  rest of the cores idle. `ProcessPoolExecutor` already reassigns an
+  idle worker to the next queued chunk dynamically, but that only helps
+  if every chunk costs about the same; `_chunk_pairs`'s old equal-*count*
+  slicing didn't guarantee that, since `score_pair()`'s real cost is
+  `O(preview_scenes * candidate_scenes)`, not uniform per pair, and
+  `pairs` is built by a preview-outer loop — every pair sharing one
+  preview is contiguous, so a single high-scene-count preview produced a
+  run of expensive pairs that equal-count slicing could drop into just
+  one or two chunks (stragglers). Fixed with greedy LPT bin-packing
+  (`_chunk_pairs`'s new optional `cost_fn` parameter, wired to a
+  scene-count-product proxy in `main()`): pairs are sorted by estimated
+  cost and dealt into whichever chunk currently has the lowest running
+  total, balancing each chunk's *estimated total cost* up front rather
+  than just its pair count. Composes with (doesn't replace) the existing
+  dynamic reassignment. Verified live: `--workers 1` and `--workers 3`
+  against identical seeded DBs still produce byte-for-byte identical
+  `matches` rows; a synthetic skewed-cost test confirms the new chunking
+  beats plain equal-count slicing on worst-chunk cost.
+
 ## 2026-06-22 — 0.11.0
 
 - **New false-positive class, found via real review (video #2237)**: a

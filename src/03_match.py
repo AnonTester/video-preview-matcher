@@ -103,8 +103,11 @@ on a single core):
     pair's scoring after that is pure in-memory comparison, zero DB
     access. Hashes are also parsed hex->int once at load time (`int(h, 16)`
     on every Hamming-distance call, across millions of comparisons, was
-    real overhead) and `best_scene_match` uses `int.bit_count()` instead
-    of `bin(x).count("1")` for the XOR popcount.
+    real overhead) — originally paired with `int.bit_count()` instead of
+    `bin(x).count("1")` for the XOR popcount; both the per-pair Python
+    loop and that scalar popcount were later replaced wholesale by
+    `score_scenes`'s vectorized numpy version, see VECTORIZED SCORING
+    below.
 
     With that fixed, scoring itself is pure CPU work with no shared state
     needed beyond the read-only preloaded dicts, so it parallelizes
@@ -125,6 +128,51 @@ on a single core):
     real on production hardware yet — do that before assuming the
     default is optimal; see README's "Tuning" section.
 
+    COST-AWARE CHUNKING: `_chunk_pairs`'s `cost_fn` parameter balances
+    each chunk's *estimated total cost* (scene-count product), not just
+    its pair count — fixes a real "workers drain to a handful of
+    stragglers" issue found live on homeserver. See `_chunk_pairs`'s own
+    docstring for the full story, including a real OOM/server-crash
+    incident caused by an earlier version of this fix that sorted a
+    cost-tagged copy of every pair up front (~2.5-3GB of transient
+    allocation at full-library scale) — the shipped version greedily
+    bin-packs in arrival order instead, with no per-pair allocation
+    beyond what plain slicing already needed.
+
+VECTORIZED SCORING (`VideoScenes`/`score_scenes`, replacing the old
+per-scene Python-dict / nested-loop `best_scene_match`): two separate
+problems, one fix. (1) A 64-bit hash as a Python int is 36 bytes
+(measured via `sys.getsizeof`); a bare scene dict's own shell (before any
+of its values) is ~270 bytes — at full-library scale that's real memory,
+not rounding error. (2) More importantly, the same OOM/server-crash
+incident referenced above was most likely actually caused by something
+this section fixes, not the chunking bug: `ProcessPoolExecutor`'s
+`initargs` hands every forked worker the same preloaded scene data, and
+Linux's `fork()` normally shares those pages copy-on-write — but CPython's
+reference counting touches every object's refcount on *any* access, even
+a read, which dirties the page and forces a private copy. With scene data
+as a Python dict-of-dicts, every single hash/timestamp lookup during
+scoring is exactly such a touch, so each of the N forked workers
+gradually accumulates its own copies of pages it merely *read* — a slow
+RSS creep over a run's lifetime, not a one-time cost (this fits the
+observed incident's timeline far better than the chunking bug above,
+which spikes once, upfront, before any pair is scored). `VideoScenes`
+packs each video's hashes/timestamps into contiguous numpy arrays
+instead; a vectorized op (`np.bitwise_count`, numpy 2.0+) reads the raw
+buffer directly in C without creating a Python object per element, so it
+never touches a per-hash refcount — those pages stay genuinely shared
+across all forked workers for the buffer's entire lifetime, not just at
+fork time. `score_scenes()` computes the full (n_preview, n_candidate, 3,
+3) Hamming-distance tensor for an entire pair in a handful of numpy
+calls instead of n_preview * n_candidate * 9 individual Python-level
+comparisons — a speedup, but secondary to the memory/sharing fix above.
+Tie-breaking matches the old nested-loop order exactly (see
+`score_scenes`'s own docstring) — verified against the old implementation
+across thousands of randomized trials, including deliberately-induced
+ties, before it was replaced; `--workers 1` vs `--workers N` against
+identical seeded DBs were also re-confirmed byte-identical after this
+change, same as after every previous change to this stage.
+
 Usage:
     python3 src/03_match.py --db data/library.db [--hash-threshold 8]
                              [--color-threshold 0.25] [--min-ratio 0.02]
@@ -135,16 +183,56 @@ Usage:
 """
 
 import argparse
+import heapq
 import json
 import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from db import connect, init_db, update_scan_run
 import phash as ph
+
+# Column order for VideoScenes.phash — must match the old p_variants/
+# c_variants tuple order exactly (see VideoScenes docstring): tie-breaking
+# in score_scenes() depends on this matching the historical iteration
+# order bit-for-bit.
+PHASH_VARIANTS = ("normal", "cropped", "flipped")
+
+
+@dataclass
+class VideoScenes:
+    """Columnar, numpy-backed scene data for one video — replaces the old
+    list of per-scene Python dicts (see module docstring's VECTORIZED
+    SCORING section). Packs hashes/timestamps into contiguous numpy
+    buffers instead of one Python int/float/dict object per field per
+    scene: a 64-bit hash as a Python int is 36 bytes (measured via
+    sys.getsizeof) vs. 8 bytes packed in a uint64 array with zero
+    per-element object overhead, and a bare scene dict's own shell is
+    ~270 bytes before counting any of its values. More importantly for a
+    forked ProcessPoolExecutor: reading a numpy array during a vectorized
+    op never touches a per-element Python refcount, so these buffers stay
+    genuinely shared copy-on-write across worker processes instead of
+    each worker privately duplicating pages as it touches them — see
+    CHANGELOG for the production incident this addresses.
+
+    `color_sig` is nullable per-scene in the DB (legacy data only — every
+    scene `02_fingerprint.py` writes today always has one); `has_color_sig`
+    tracks that per scene since a numpy array can't hold a ragged/None
+    entry inline."""
+    timestamp_sec: np.ndarray      # float64, shape (n,)
+    duration_to_next: np.ndarray   # float64, shape (n,); NaN = unknown (last scene in its video)
+    phash: np.ndarray              # uint64, shape (n, 3); columns in PHASH_VARIANTS order
+    color_sig: np.ndarray          # uint8, shape (n, sig_len)
+    has_color_sig: np.ndarray      # bool, shape (n,)
+
+    def __len__(self):
+        return len(self.timestamp_sec)
 
 
 def load_dismissed_pairs(conn) -> set[tuple[int, int]]:
@@ -156,15 +244,16 @@ def load_dismissed_pairs(conn) -> set[tuple[int, int]]:
     return {(r["preview_id"], r["candidate_id"]) for r in rows}
 
 
-def load_all_scenes(conn, min_scene_duration: float = 0.0) -> dict[int, list[dict]]:
-    """Every video's scenes, preloaded once — see module docstring's
-    PERFORMANCE section for why this replaced a per-pair, per-side
-    `SELECT`. Hashes are parsed from hex to int here, once, so the
-    comparison loop never re-parses the same string across the many pairs
-    that share a video.
+def load_all_scenes(conn, min_scene_duration: float = 0.0) -> dict[int, VideoScenes]:
+    """Every video's scenes, preloaded once into columnar numpy arrays
+    (`VideoScenes`) — see module docstring's PERFORMANCE/VECTORIZED
+    SCORING sections for why this replaced a per-pair, per-side `SELECT`
+    and then, later, a list of per-scene Python dicts. Hashes are parsed
+    from hex to int here, once, so nothing downstream re-parses the same
+    string across the many pairs that share a video.
 
-    Each scene also gets `duration_to_next` (gap to the next scene-cut in
-    the same video, by `scene_index` order; None for a video's last scene
+    Each video also gets `duration_to_next` (gap to the next scene-cut in
+    the same video, by `scene_index` order; NaN for a video's last scene
     — its true duration isn't knowable from `scenes` alone, see module
     docstring). Scenes with a known duration below `min_scene_duration`
     are dropped entirely (not just down-weighted) before any pair is
@@ -173,26 +262,42 @@ def load_all_scenes(conn, min_scene_duration: float = 0.0) -> dict[int, list[dic
         "SELECT video_id, scene_index, timestamp_sec, phash, phash_cropped, phash_flipped, color_sig "
         "FROM scenes ORDER BY video_id, scene_index"
     ).fetchall()
-    raw_by_video: dict[int, list[dict]] = {}
+    raw_by_video: dict[int, list] = {}
     for r in rows:
-        raw_by_video.setdefault(r["video_id"], []).append({
-            "timestamp_sec": r["timestamp_sec"],
-            "phash": int(r["phash"], 16),
-            "phash_cropped": int(r["phash_cropped"], 16),
-            "phash_flipped": int(r["phash_flipped"], 16),
-            "color_sig": r["color_sig"],
-        })
+        raw_by_video.setdefault(r["video_id"], []).append(r)
 
-    by_video: dict[int, list[dict]] = {}
-    for video_id, scenes in raw_by_video.items():
-        kept = []
-        for i, s in enumerate(scenes):
-            duration = scenes[i + 1]["timestamp_sec"] - s["timestamp_sec"] if i + 1 < len(scenes) else None
-            if duration is not None and duration < min_scene_duration:
-                continue
-            s["duration_to_next"] = duration
-            kept.append(s)
-        by_video[video_id] = kept
+    by_video: dict[int, VideoScenes] = {}
+    for video_id, scene_rows in raw_by_video.items():
+        n = len(scene_rows)
+        timestamps = np.array([r["timestamp_sec"] for r in scene_rows], dtype=np.float64)
+
+        durations = np.full(n, np.nan, dtype=np.float64)
+        durations[:-1] = timestamps[1:] - timestamps[:-1]  # no-op slice when n<=1
+
+        keep = np.isnan(durations) | (durations >= min_scene_duration)
+        if not keep.all():
+            scene_rows = [r for r, k in zip(scene_rows, keep) if k]
+            timestamps = timestamps[keep]
+            durations = durations[keep]
+            n = len(scene_rows)
+
+        phash = np.empty((n, 3), dtype=np.uint64)
+        has_color_sig = np.zeros(n, dtype=bool)
+        sig_len = next((len(r["color_sig"]) for r in scene_rows if r["color_sig"]), 0)
+        color_sig = np.zeros((n, sig_len), dtype=np.uint8)
+        for i, r in enumerate(scene_rows):
+            phash[i, 0] = int(r["phash"], 16)
+            phash[i, 1] = int(r["phash_cropped"], 16)
+            phash[i, 2] = int(r["phash_flipped"], 16)
+            sig = r["color_sig"]
+            if sig and len(sig) == sig_len:
+                has_color_sig[i] = True
+                color_sig[i] = [int(ch, 16) for ch in sig]
+
+        by_video[video_id] = VideoScenes(
+            timestamp_sec=timestamps, duration_to_next=durations,
+            phash=phash, color_sig=color_sig, has_color_sig=has_color_sig,
+        )
     return by_video
 
 
@@ -203,54 +308,70 @@ def load_all_audio(conn) -> dict[int, dict]:
     return {r["video_id"]: {"fingerprint": r["fingerprint"], "fp_ok": r["fp_ok"]} for r in rows}
 
 
-def best_scene_match(preview_scene, candidate_scenes, hash_threshold, color_threshold):
+def score_scenes(preview: VideoScenes, candidate: VideoScenes, hash_threshold, color_threshold) -> list[dict]:
+    """Vectorized replacement for the old per-scene best_scene_match()
+    Python loop — see module docstring's VECTORIZED SCORING section.
+    Computes the full (n_preview, n_candidate, 3, 3) Hamming-distance
+    tensor in a handful of numpy calls instead of nested Python loops
+    (n_preview * n_candidate * 9 individual comparisons, each with its
+    own function-call/tuple-unpacking overhead), then reduces to one best
+    match per preview scene.
+
+    Tie-breaking (which (candidate_scene, p_variant, c_variant) wins when
+    several are equally close) is bit-for-bit identical to the old "first
+    strictly-lower distance wins" rule: flattening the trailing
+    (candidate_scene, p_variant, c_variant) axes in that order — candidate
+    scene slowest, p_variant middle, c_variant fastest — reproduces the
+    old nested loop's exact iteration order, and numpy's argmin returns
+    the first occurrence on ties just like the old `dist < best[0]`
+    strict inequality did. Verified against the old implementation across
+    thousands of randomized trials with deliberately-induced ties before
+    this replaced it (see CHANGELOG).
     """
-    Compare one preview scene against every candidate scene across all
-    crop/flip variant combinations. Returns a dict (distance, candidate_ts,
-    variant, preview_ts, preview_scene_duration, candidate_scene_duration)
-    or None if nothing clears the threshold. Hashes are already ints (see
-    load_all_scenes) — XOR + int.bit_count() is the popcount, faster than
-    bin(x).count("1") and avoids re-parsing hex.
-    """
-    p_variants = (
-        ("normal", preview_scene["phash"]),
-        ("cropped", preview_scene["phash_cropped"]),
-        ("flipped", preview_scene["phash_flipped"]),
-    )
-    best = None  # (distance, candidate_ts, candidate_duration, "p_variant-vs-c_variant", c_color_sig)
+    n_p, n_c = len(preview), len(candidate)
+    if n_p == 0 or n_c == 0:
+        return []
 
-    for c_scene in candidate_scenes:
-        c_variants = (
-            ("normal", c_scene["phash"]),
-            ("cropped", c_scene["phash_cropped"]),
-            ("flipped", c_scene["phash_flipped"]),
-        )
-        for p_label, p_hash in p_variants:
-            for c_label, c_hash in c_variants:
-                dist = (p_hash ^ c_hash).bit_count()
-                if best is None or dist < best[0]:
-                    best = (dist, c_scene["timestamp_sec"], c_scene.get("duration_to_next"),
-                             f"{p_label}-vs-{c_label}", c_scene["color_sig"])
+    p_b = preview.phash[:, np.newaxis, :, np.newaxis]    # (n_p,1,3,1)
+    c_b = candidate.phash[np.newaxis, :, np.newaxis, :]  # (1,n_c,1,3)
+    dist = np.bitwise_count(p_b ^ c_b)                   # (n_p,n_c,3,3)
 
-    if best is None:
-        return None
+    flat = dist.reshape(n_p, n_c * 9)
+    best_flat_idx = flat.argmin(axis=1)
+    best_dist = flat[np.arange(n_p), best_flat_idx]
+    j_idx, pv_idx, cv_idx = np.unravel_index(best_flat_idx, (n_c, 3, 3))
 
-    dist, c_ts, c_duration, variant, c_color_sig = best
-    if dist > hash_threshold:
-        return None
+    matched = []
+    for i in range(n_p):
+        dist_i = int(best_dist[i])
+        if dist_i > hash_threshold:
+            continue
+        j = int(j_idx[i])
 
-    # Color-collision guard: only applied against the "normal" comparison
-    # color signature, since crop changes histogram proportions by design.
-    c_dist = ph.color_distance(preview_scene["color_sig"], c_color_sig) if preview_scene.get("color_sig") and c_color_sig else 0.0
-    if c_dist > color_threshold:
-        return None
+        # Color-collision guard: only applied against the "normal"
+        # comparison color signature (one value per scene, independent
+        # of which crop/flip variant won), since crop changes histogram
+        # proportions by design — same as the old best_scene_match().
+        if preview.has_color_sig[i] and candidate.has_color_sig[j]:
+            sig_len = preview.color_sig.shape[1]
+            c_dist = float(np.abs(preview.color_sig[i].astype(np.float64)
+                                   - candidate.color_sig[j].astype(np.float64)).sum() / (15.0 * sig_len))
+        else:
+            c_dist = 0.0
+        if c_dist > color_threshold:
+            continue
 
-    return {
-        "distance": dist, "candidate_ts": c_ts, "variant": variant,
-        "preview_ts": preview_scene["timestamp_sec"],
-        "preview_scene_duration": preview_scene.get("duration_to_next"),
-        "candidate_scene_duration": c_duration,
-    }
+        p_dur = preview.duration_to_next[i]
+        c_dur = candidate.duration_to_next[j]
+        matched.append({
+            "distance": dist_i,
+            "candidate_ts": float(candidate.timestamp_sec[j]),
+            "variant": f"{PHASH_VARIANTS[pv_idx[i]]}-vs-{PHASH_VARIANTS[cv_idx[i]]}",
+            "preview_ts": float(preview.timestamp_sec[i]),
+            "preview_scene_duration": None if np.isnan(p_dur) else float(p_dur),
+            "candidate_scene_duration": None if np.isnan(c_dur) else float(c_dur),
+        })
+    return matched
 
 
 def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_threshold, color_threshold):
@@ -263,11 +384,7 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
     if not preview_scenes or not candidate_scenes:
         return None
 
-    matched = []
-    for p_scene in preview_scenes:
-        m = best_scene_match(p_scene, candidate_scenes, hash_threshold, color_threshold)
-        if m:
-            matched.append(m)
+    matched = score_scenes(preview_scenes, candidate_scenes, hash_threshold, color_threshold)
 
     visual_score = len(matched) / len(preview_scenes)
 
@@ -326,19 +443,97 @@ def chromaprint_similarity(fp_a: str, fp_b: str) -> float:
     return matches / n
 
 
-def _chunk_pairs(pairs: list, workers: int) -> list[list]:
+# Rough single-worker throughput estimate used to translate
+# --progress-interval (seconds) into a pairs-per-chunk target — see
+# _chunk_pairs's docstring. Derived from the one real measurement on
+# record: ~11.7M pairs / ~16.5 min / 15 workers (homeserver, the run that
+# preceded the 0.11.x chunking fix and the 0.12.0 vectorization rewrite)
+# = ~788 pairs/sec/worker. That run predates vectorized scoring, so this
+# is almost certainly conservative now (chunks will likely finish faster
+# than requested, not slower) — recalibrate against a real vectorized
+# run's measured throughput once one exists, rather than trusting this
+# number indefinitely.
+PAIRS_PER_WORKER_SEC = 788
+
+
+def _chunk_pairs(pairs: list, workers: int, cost_fn=None, progress_interval_sec: float = None) -> list[list]:
     """Split `pairs` into chunks sized so there are comfortably more
     chunks than workers (for load balancing and incremental progress
     reporting) without going so fine-grained that per-task scheduling/IPC
     overhead dominates the actual scoring work. Aims for ~4x as many
     chunks as workers, floored at 40 chunks total so small workers counts
-    still get reasonable progress granularity, with a minimum chunk size
-    of 1 (so this never divides by zero or produces an empty chunk)."""
+    still get reasonable progress granularity.
+
+    `progress_interval_sec`, if given, additionally raises the chunk
+    count so each chunk represents roughly this many seconds of work for
+    *one* worker, using PAIRS_PER_WORKER_SEC's rough throughput estimate
+    — found necessary because the count-based floor above doesn't scale
+    with `len(pairs)` at all: a fixed ~60 chunks (15 workers * 4) means
+    each chunk's *size*, and therefore duration, grows linearly with the
+    pair count, which is exactly why a small test run feels responsive
+    (chunks finish in seconds) while a real full-library run reports
+    progress only every few minutes (each chunk takes minutes). This
+    only ever raises the chunk count above the worker-based floor, never
+    lowers it, so small runs are unaffected.
+
+    `cost_fn(preview_id, candidate_id) -> float` estimates each pair's
+    relative scoring cost (score_pair() is O(preview_scenes *
+    candidate_scenes), not uniform per pair — see module docstring's
+    PERFORMANCE section). When given, pairs are greedily bin-packed in
+    their original order — each pair goes into whichever chunk currently
+    has the lowest running cost total — so every chunk's *estimated
+    total cost* ends up balanced, not just its pair count.
+
+    This matters because `pairs` is built by a preview-outer loop (see
+    main()), so every pair sharing one preview is contiguous — a single
+    preview with an unusually high scene count produces a run of
+    expensive pairs that, under plain equal-count slicing, can land in
+    just one or two chunks. ProcessPoolExecutor already reassigns
+    finished workers to the next queued chunk dynamically, but that only
+    helps if no single chunk is disproportionately expensive — found
+    live on homeserver (16 cores, --workers auto): the running worker
+    count visibly drained over a match run as most chunks finished
+    quickly and a couple of workers were left grinding through
+    high-scene-count stragglers alone.
+
+    Deliberately *not* sorted by descending cost first (textbook LPT
+    scheduling) despite that giving a marginally tighter worst-case
+    bound: at full-library scale (5000 videos, ~11.7M pairs) sorting
+    means materializing a new (cost, preview_id, candidate_id) tuple per
+    pair — measured at ~2.5-3GB of purely transient allocation, found
+    live after it contributed to a real OOM/thrashing incident (system
+    already had ~0 free RAM and fully-used swap from other concurrent
+    work; this was the straw that broke it, server required a hard
+    reboot — see CHANGELOG). Greedily filling the currently-lightest
+    chunk in *arrival* order already spreads a contiguous run of
+    expensive pairs across separate chunks just as well for this
+    workload's actual failure mode (one or a few unusually scene-heavy
+    previews, not an adversarial cost ordering) — the first chunk to
+    receive an expensive pair stops being the lightest, so the next
+    expensive pair (wherever it falls) goes to a different chunk. The
+    only extra memory cost versus plain slicing is the n_chunks-sized
+    heap; no per-pair allocation beyond what slicing already needed.
+    Without `cost_fn`, falls back to plain equal-count slicing (used by
+    callers that don't have per-video scene counts handy, e.g. tests)."""
     if not pairs:
         return []
     target_chunks = max(workers * 4, 40)
-    chunk_size = max(1, -(-len(pairs) // target_chunks))  # ceil division
-    return [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+    if progress_interval_sec is not None:
+        target_pairs_per_chunk = max(1, int(PAIRS_PER_WORKER_SEC * progress_interval_sec))
+        target_chunks = max(target_chunks, -(-len(pairs) // target_pairs_per_chunk))  # ceil division
+    n_chunks = min(target_chunks, len(pairs))
+
+    if cost_fn is None:
+        chunk_size = max(1, -(-len(pairs) // n_chunks))  # ceil division
+        return [pairs[i:i + chunk_size] for i in range(0, len(pairs), chunk_size)]
+
+    heap = [(0.0, i) for i in range(n_chunks)]  # (chunk's running total cost, chunk index)
+    chunks: list[list] = [[] for _ in range(n_chunks)]
+    for pc in pairs:
+        total, idx = heapq.heappop(heap)
+        chunks[idx].append(pc)  # reuse the existing tuple — no per-pair allocation
+        heapq.heappush(heap, (total + cost_fn(*pc), idx))
+    return chunks
 
 
 # Populated once per worker process by _init_worker — see module docstring's
@@ -394,6 +589,11 @@ def main():
                           "02_fingerprint.py's --workers, more cores should mostly just help here, but "
                           "this hasn't been benchmarked for real yet; see README's Tuning section). "
                           "1 = sequential, no process pool. Default: cpu count - 1")
+    ap.add_argument("--progress-interval", type=float, default=10.0,
+                     help="--workers > 1 only: target seconds of work per chunk, so progress updates "
+                          "land roughly this often instead of the chunk count being fixed regardless "
+                          "of pair count — see _chunk_pairs's docstring for the (rough, pre-vectorization) "
+                          "throughput estimate this is translated through")
     ap.add_argument("--run-id", type=int, default=None,
                      help="internal: scan_runs row to report progress to (set by the web UI's scan orchestrator)")
     args = ap.parse_args()
@@ -460,7 +660,10 @@ def main():
                                  message=f"{i:,}/{len(pairs):,} pairs scored", updated_at=time.time())
         done_pairs = len(pairs)
     else:
-        chunks = _chunk_pairs(pairs, args.workers)
+        def _pair_cost(preview_id, candidate_id):
+            return len(scenes_by_video.get(preview_id, ())) * len(scenes_by_video.get(candidate_id, ()))
+
+        chunks = _chunk_pairs(pairs, args.workers, cost_fn=_pair_cost, progress_interval_sec=args.progress_interval)
         with ProcessPoolExecutor(
             max_workers=args.workers, initializer=_init_worker,
             initargs=(scenes_by_video, audio_by_video, args.hash_threshold, args.color_threshold),

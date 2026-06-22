@@ -306,16 +306,50 @@ calibrated values. Expect to spend real time here:
   with mid-run rather than guessing up front and restarting.
 
 - **`--workers`** (`03_match.py`, default cpu count − 1): unlike
-  fingerprinting, this stage has no I/O, GPU, or shared-resource
-  contention (pure in-memory hash comparison after the preload — see
-  03_match.py's PERFORMANCE docstring section), so more cores should
-  mostly just help. Exactly how much, and whether leaving a core free
-  (the default) vs. using every core matters in practice, hasn't been
-  benchmarked for real yet. Worth comparing `cores-1`, `cores/2`,
-  `2*cores/3`, and `3*cores/4` against your own hardware and pair count
-  before settling on a value — `--workers 1` runs the old sequential
-  path (no process pool) if you want a baseline to compare against, or
-  need to debug scoring logic without multiprocess noise.
+  fingerprinting, this stage has no I/O or GPU contention (pure in-memory
+  hash comparison after the preload — see 03_match.py's PERFORMANCE
+  docstring section), so more cores should mostly just help *CPU-wise*.
+  It was **not** free of shared-resource contention once RAM is
+  considered, though: every worker is a forked copy of the main process
+  and receives the full preloaded scene data. Linux's `fork()` normally
+  shares those pages copy-on-write, but CPython's reference counting
+  touches every object's refcount on any access (even a read), which
+  dirties the page and forces a private copy — with the old per-scene
+  Python-dict representation, every hash/timestamp lookup during scoring
+  was exactly such a touch, so each worker's RSS could creep up well past
+  its fair share over the course of a run, not just at startup. This
+  contributed to a real production incident (server required a hard
+  reboot — see CHANGELOG) on a ~5000-video library, much larger than the
+  ~2000-video scale this stage was last validated against. 0.12.0's
+  `VideoScenes`/`score_scenes` rewrite (numpy-vectorized, see
+  03_match.py's VECTORIZED SCORING docstring section) should fix this —
+  vectorized ops read the raw array buffer in C without touching a
+  per-element refcount, so those pages stay genuinely shared — but it
+  hasn't yet been confirmed against a real multi-minute run at full
+  library scale with RSS watched live. Until that's done, don't assume
+  `cpu_count - 1` is safe just because cores are free at large library
+  sizes — watch actual memory (`free -m`, `docker stats`) over a real
+  run, ideally starting with a reduced `--workers` and/or a
+  `--limit`-bounded subset. Exactly how much more cores help, and
+  whether leaving a core free (the default) vs. using every core matters
+  in practice, also hasn't been benchmarked for real yet. `--workers 1`
+  runs the old sequential path (no process pool, no preload duplication
+  at all) if you want a baseline.
+
+- **`--progress-interval`** (`03_match.py`, default `10.0` seconds,
+  `--workers > 1` only): target seconds of work per chunk, so progress
+  updates land roughly this often. Without it, chunk *count* is fixed at
+  `workers * 4` (floored at 40) regardless of how many pairs there are —
+  fine for a small test run (each chunk finishes in seconds either way)
+  but means a real full-library run's chunks grow in lockstep with the
+  pair count, reporting progress only every few minutes once there are
+  millions of pairs. Translated to a pairs-per-chunk target via a rough
+  single-worker throughput estimate (`PAIRS_PER_WORKER_SEC` in
+  `03_match.py`) measured from the one real pre-vectorization benchmark
+  on record — likely conservative now that scoring is vectorized
+  (chunks will probably finish faster than requested, not slower), so
+  treat the actual observed cadence as the thing to calibrate against,
+  not this default.
 
 **Recommended first real run:** `--limit 100` (or point `01_inventory.py`
 at a small subdirectory) through the whole pipeline, review results in the

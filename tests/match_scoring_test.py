@@ -2,12 +2,14 @@
 Tests 03_match.py's preload-once + parallel-scoring rework: load_all_scenes/
 load_all_audio (replacing a per-pair, per-side SELECT — see module
 docstring's PERFORMANCE section for why that was the actual bottleneck
-against a real library), the in-memory score_pair()/best_scene_match(), and
-_chunk_pairs() (the work-splitting helper for --workers > 1). Doesn't spin
-up a real ProcessPoolExecutor — that part is exercised live (see README's
-Tuning section); this only covers the pure logic feeding it. Loads
-03_match.py directly via importlib (its filename starts with a digit, so it
-can't be `import`ed normally). Run from project root:
+against a real library), the in-memory score_pair()/score_scenes() (the
+vectorized, numpy-backed scoring path — see module docstring's VECTORIZED
+SCORING section), and _chunk_pairs() (the work-splitting helper for
+--workers > 1). Doesn't spin up a real ProcessPoolExecutor — that part is
+exercised live (see README's Tuning section); this only covers the pure
+logic feeding it. Loads 03_match.py directly via importlib (its filename
+starts with a digit, so it can't be `import`ed normally). Run from
+project root:
 
     python3 tests/match_scoring_test.py
 """
@@ -15,6 +17,8 @@ can't be `import`ed normally). Run from project root:
 import importlib.util
 import sys
 from pathlib import Path
+
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -50,9 +54,9 @@ def test_load_all_scenes_parses_hex_to_int_and_groups_by_video():
         by_video = match_mod.load_all_scenes(conn)
 
     assert set(by_video.keys()) == {1, 2}
-    assert by_video[1][0]["phash"] == int("ff00", 16)
-    assert by_video[1][0]["phash_cropped"] == int("ff01", 16)
-    assert isinstance(by_video[1][0]["phash"], int)
+    assert by_video[1].phash[0, 0] == int("ff00", 16)
+    assert by_video[1].phash[0, 1] == int("ff01", 16)
+    assert by_video[1].phash.dtype == np.uint64
     print("test_load_all_scenes_parses_hex_to_int_and_groups_by_video: OK")
 
 
@@ -77,10 +81,28 @@ def test_load_all_audio_groups_by_video():
     print("test_load_all_audio_groups_by_video: OK")
 
 
-def _scene(ts, phash_hex, color_sig="00", duration_to_next=None):
-    h = int(phash_hex, 16)
-    return {"timestamp_sec": ts, "phash": h, "phash_cropped": h, "phash_flipped": h,
-            "color_sig": color_sig, "duration_to_next": duration_to_next}
+def _video_scenes(entries):
+    """Build a VideoScenes directly (bypassing load_all_scenes/a real DB)
+    from a list of (ts, phash_hex, duration_to_next, color_sig_hex)
+    tuples — the last two are optional (default None). phash_hex is used
+    for all 3 variants (normal/cropped/flipped); tests that need them to
+    differ build the arrays by hand instead. Mirrors exactly what
+    load_all_scenes() would produce for the same data, so score_scenes()/
+    score_pair() tests can construct precise scenarios without a DB."""
+    n = len(entries)
+    ts = np.array([e[0] for e in entries], dtype=np.float64)
+    dur = np.array([np.nan if len(e) < 3 or e[2] is None else e[2] for e in entries], dtype=np.float64)
+    phash = np.array([[int(e[1], 16)] * 3 for e in entries], dtype=np.uint64)
+    sigs = [e[3] if len(e) > 3 else None for e in entries]
+    sig_len = max((len(s) for s in sigs if s), default=0)
+    color_sig = np.zeros((n, sig_len), dtype=np.uint8)
+    has_color_sig = np.zeros(n, dtype=bool)
+    for i, s in enumerate(sigs):
+        if s:
+            has_color_sig[i] = True
+            color_sig[i] = [int(ch, 16) for ch in s]
+    return match_mod.VideoScenes(timestamp_sec=ts, duration_to_next=dur, phash=phash,
+                                  color_sig=color_sig, has_color_sig=has_color_sig)
 
 
 def _insert_scene(conn, video_id, scene_index, ts, phash_hex="ff00"):
@@ -102,8 +124,9 @@ def test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none():
     with connect(TMP_DB) as conn:
         by_video = match_mod.load_all_scenes(conn)  # min_scene_duration=0.0 default, nothing dropped
 
-    durations = [s["duration_to_next"] for s in by_video[1]]
-    assert durations == [2.0, 3.0, None]
+    durations = by_video[1].duration_to_next
+    assert list(durations[:2]) == [2.0, 3.0]
+    assert np.isnan(durations[2])
     print("test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none: OK")
 
 
@@ -128,37 +151,56 @@ def test_load_all_scenes_drops_scenes_shorter_than_min_duration():
     # being close to the dropped pair, since *its* forward gap (to 10.0)
     # is 8s — duration is about each scene's own span, not proximity to
     # neighbors.
-    kept_ts = [s["timestamp_sec"] for s in by_video[1]]
+    kept_ts = list(by_video[1].timestamp_sec)
     assert kept_ts == [2.0, 10.0, 20.0], kept_ts
     print("test_load_all_scenes_drops_scenes_shorter_than_min_duration: OK")
 
 
-def test_best_scene_match_finds_identical_hash_at_zero_distance():
-    preview_scene = _scene(1.0, "ff00ff00ff00ff00")
-    candidate_scenes = [_scene(5.0, "ff00ff00ff00ff00")]
-    m = match_mod.best_scene_match(preview_scene, candidate_scenes, hash_threshold=8, color_threshold=0.25)
-    assert m is not None
-    assert m["distance"] == 0
-    assert m["candidate_ts"] == 5.0
-    print("test_best_scene_match_finds_identical_hash_at_zero_distance: OK")
+def test_score_scenes_finds_identical_hash_at_zero_distance():
+    preview = _video_scenes([(1.0, "ff00ff00ff00ff00", None)])
+    candidate = _video_scenes([(5.0, "ff00ff00ff00ff00", None)])
+    matched = match_mod.score_scenes(preview, candidate, hash_threshold=8, color_threshold=0.25)
+    assert len(matched) == 1
+    assert matched[0]["distance"] == 0
+    assert matched[0]["candidate_ts"] == 5.0
+    print("test_score_scenes_finds_identical_hash_at_zero_distance: OK")
 
 
-def test_best_scene_match_rejects_over_threshold():
+def test_score_scenes_rejects_over_threshold():
     # 0xffff... vs 0x0000... is maximally different (all bits flipped)
-    preview_scene = _scene(1.0, "ffffffffffffffff")
-    candidate_scenes = [_scene(5.0, "0000000000000000")]
-    m = match_mod.best_scene_match(preview_scene, candidate_scenes, hash_threshold=8, color_threshold=0.25)
-    assert m is None
-    print("test_best_scene_match_rejects_over_threshold: OK")
+    preview = _video_scenes([(1.0, "ffffffffffffffff", None)])
+    candidate = _video_scenes([(5.0, "0000000000000000", None)])
+    matched = match_mod.score_scenes(preview, candidate, hash_threshold=8, color_threshold=0.25)
+    assert matched == []
+    print("test_score_scenes_rejects_over_threshold: OK")
 
 
-def test_best_scene_match_carries_scene_durations_through():
-    preview_scene = _scene(1.0, "ff00ff00ff00ff00", duration_to_next=4.0)
-    candidate_scenes = [_scene(5.0, "ff00ff00ff00ff00", duration_to_next=6.0)]
-    m = match_mod.best_scene_match(preview_scene, candidate_scenes, hash_threshold=8, color_threshold=0.25)
-    assert m["preview_scene_duration"] == 4.0
-    assert m["candidate_scene_duration"] == 6.0
-    print("test_best_scene_match_carries_scene_durations_through: OK")
+def test_score_scenes_carries_scene_durations_through():
+    preview = _video_scenes([(1.0, "ff00ff00ff00ff00", 4.0)])
+    candidate = _video_scenes([(5.0, "ff00ff00ff00ff00", 6.0)])
+    matched = match_mod.score_scenes(preview, candidate, hash_threshold=8, color_threshold=0.25)
+    assert matched[0]["preview_scene_duration"] == 4.0
+    assert matched[0]["candidate_scene_duration"] == 6.0
+    print("test_score_scenes_carries_scene_durations_through: OK")
+
+
+def test_score_scenes_empty_side_returns_empty_list():
+    preview = _video_scenes([(1.0, "ff00ff00ff00ff00", None)])
+    empty = _video_scenes([])
+    assert match_mod.score_scenes(preview, empty, hash_threshold=8, color_threshold=0.25) == []
+    assert match_mod.score_scenes(empty, preview, hash_threshold=8, color_threshold=0.25) == []
+    print("test_score_scenes_empty_side_returns_empty_list: OK")
+
+
+def test_score_scenes_color_guard_rejects_distant_color_even_at_zero_hash_distance():
+    # Identical pHash but wildly different color signatures should still
+    # be rejected by the color-collision guard (phash.py's color_sig
+    # docstring: pHash alone is color-blind).
+    preview = _video_scenes([(1.0, "ff00ff00ff00ff00", None, "f" * 64)])
+    candidate = _video_scenes([(5.0, "ff00ff00ff00ff00", None, "0" * 64)])
+    matched = match_mod.score_scenes(preview, candidate, hash_threshold=8, color_threshold=0.25)
+    assert matched == []
+    print("test_score_scenes_color_guard_rejects_distant_color_even_at_zero_hash_distance: OK")
 
 
 def test_score_pair_missing_scenes_returns_none():
@@ -169,8 +211,8 @@ def test_score_pair_missing_scenes_returns_none():
 
 def test_score_pair_perfect_visual_match_no_audio():
     scenes_by_video = {
-        1: [_scene(1.0, "ff00ff00ff00ff00"), _scene(2.0, "00ff00ff00ff00ff"), _scene(3.0, "ffff0000ffff0000")],
-        2: [_scene(10.0, "ff00ff00ff00ff00"), _scene(20.0, "00ff00ff00ff00ff"), _scene(30.0, "ffff0000ffff0000")],
+        1: _video_scenes([(1.0, "ff00ff00ff00ff00", None), (2.0, "00ff00ff00ff00ff", None), (3.0, "ffff0000ffff0000", None)]),
+        2: _video_scenes([(10.0, "ff00ff00ff00ff00", None), (20.0, "00ff00ff00ff00ff", None), (30.0, "ffff0000ffff0000", None)]),
     }
     res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert res is not None
@@ -184,8 +226,8 @@ def test_score_pair_perfect_visual_match_no_audio():
 
 def test_score_pair_single_match_has_zero_spread():
     scenes_by_video = {
-        1: [_scene(1.0, "ff00ff00ff00ff00")],
-        2: [_scene(10.0, "ff00ff00ff00ff00")],
+        1: _video_scenes([(1.0, "ff00ff00ff00ff00", None)]),
+        2: _video_scenes([(10.0, "ff00ff00ff00ff00", None)]),
     }
     res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert res["match_spread_sec"] == 0.0
@@ -197,8 +239,8 @@ def test_score_pair_clustered_matches_have_small_spread():
     # other (a rapid-cut intro) all matching — weak corroboration even
     # though the raw matched-scene count clears --min-matched-scenes.
     scenes_by_video = {
-        1: [_scene(0.2, "ff00ff00ff00ff00"), _scene(1.0, "00ff00ff00ff00ff"), _scene(1.8, "ffff0000ffff0000")],
-        2: [_scene(0.1, "ff00ff00ff00ff00"), _scene(0.9, "00ff00ff00ff00ff"), _scene(1.7, "ffff0000ffff0000")],
+        1: _video_scenes([(0.2, "ff00ff00ff00ff00", None), (1.0, "00ff00ff00ff00ff", None), (1.8, "ffff0000ffff0000", None)]),
+        2: _video_scenes([(0.1, "ff00ff00ff00ff00", None), (0.9, "00ff00ff00ff00ff", None), (1.7, "ffff0000ffff0000", None)]),
     }
     res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert len(res["scene_matches"]) == 3
@@ -229,15 +271,98 @@ def test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing():
     print("test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing: OK")
 
 
+def test_chunk_pairs_with_cost_fn_covers_every_pair_exactly_once():
+    pairs = [(i, i + 1) for i in range(0, 2000, 2)]
+    chunks = match_mod._chunk_pairs(pairs, workers=8, cost_fn=lambda p, c: (p % 7) + 1)
+    flattened = [pc for chunk in chunks for pc in chunk]
+    assert sorted(flattened) == sorted(pairs), "cost-aware chunking lost or duplicated pairs"
+    assert all(len(c) > 0 for c in chunks), "cost-aware chunking produced an empty chunk"
+    print("test_chunk_pairs_with_cost_fn_covers_every_pair_exactly_once: OK")
+
+
+def test_chunk_pairs_with_cost_fn_balances_better_than_equal_count_slicing():
+    # Mirrors the real straggler scenario found live on homeserver: one
+    # preview (id=1) has many scenes and appears in a contiguous run of
+    # 20 expensive pairs, surrounded by 200 cheap ones — exactly what
+    # main()'s preview-outer pair-building loop produces for a single
+    # high-scene-count preview. Plain equal-count slicing can concentrate
+    # that whole run into a couple of chunks (stragglers); cost-aware
+    # bin-packing should spread it so no chunk needs much more than one
+    # expensive pair's worth.
+    cheap_pairs = [(100 + i, 200 + i) for i in range(200)]
+    expensive_pairs = [(1, 300 + i) for i in range(20)]
+    pairs = expensive_pairs + cheap_pairs
+
+    def cost_fn(p, c):
+        return 1000 if p == 1 else 1
+
+    naive_chunks = match_mod._chunk_pairs(pairs, workers=4)  # no cost_fn -> old equal-count behavior
+    naive_max = max(sum(cost_fn(p, c) for p, c in chunk) for chunk in naive_chunks)
+
+    balanced_chunks = match_mod._chunk_pairs(pairs, workers=4, cost_fn=cost_fn)
+    balanced_max = max(sum(cost_fn(p, c) for p, c in chunk) for chunk in balanced_chunks)
+
+    assert balanced_max <= 1000, f"expected no chunk above ~1 expensive pair's cost, got {balanced_max}"
+    assert balanced_max < naive_max, f"balanced max chunk cost {balanced_max} should beat naive {naive_max}"
+    print("test_chunk_pairs_with_cost_fn_balances_better_than_equal_count_slicing: OK")
+
+
+def test_chunk_pairs_with_cost_fn_reuses_pair_tuples_no_per_pair_allocation():
+    # Regression guard for a real OOM/server-crash incident: an earlier
+    # version of the cost-aware path built a new (cost, p, c) tuple per
+    # pair via sorted(...) before bin-packing — ~2.5-3GB of purely
+    # transient allocation at full-library scale (~11.7M pairs), which
+    # contributed to crashing the production server. The shipped version
+    # must place the *same* tuple objects from the input into chunks, not
+    # rebuilt copies.
+    pairs = [(i, i + 1) for i in range(500)]
+    chunks = match_mod._chunk_pairs(pairs, workers=4, cost_fn=lambda p, c: 1.0)
+    input_ids = {id(pc) for pc in pairs}
+    for chunk in chunks:
+        for pc in chunk:
+            assert id(pc) in input_ids, "cost-aware chunking allocated a new pair tuple instead of reusing the input's"
+    print("test_chunk_pairs_with_cost_fn_reuses_pair_tuples_no_per_pair_allocation: OK")
+
+
+def test_chunk_pairs_progress_interval_increases_chunk_count_for_large_pair_counts():
+    # The worker-based floor (workers*4, floored at 40) doesn't scale
+    # with pair count at all, which is exactly why a real full-library
+    # run reports progress only every few minutes (each chunk grows with
+    # the pair count) while a small test run looks fine. A tight
+    # progress_interval_sec against a large pair count should force well
+    # past that floor.
+    pairs = [(i, i + 1) for i in range(100_000)]
+    default_chunks = match_mod._chunk_pairs(pairs, workers=4)
+    tight_chunks = match_mod._chunk_pairs(pairs, workers=4, progress_interval_sec=1.0)
+    assert len(default_chunks) == 40, f"expected the unchanged 40-chunk floor, got {len(default_chunks)}"
+    assert len(tight_chunks) > len(default_chunks), \
+        f"tight progress_interval_sec should raise chunk count above the floor, got {len(tight_chunks)}"
+    print("test_chunk_pairs_progress_interval_increases_chunk_count_for_large_pair_counts: OK")
+
+
+def test_chunk_pairs_progress_interval_never_shrinks_below_worker_floor():
+    # A loose progress_interval_sec (here, 1 hour) against a small pair
+    # count would suggest just 1 chunk on its own — it must not pull
+    # the result below the existing workers*4/40 floor.
+    pairs = [(i, i + 1) for i in range(50)]
+    default_chunks = match_mod._chunk_pairs(pairs, workers=4)
+    loose_chunks = match_mod._chunk_pairs(pairs, workers=4, progress_interval_sec=3600.0)
+    assert len(loose_chunks) == len(default_chunks), \
+        f"a loose progress_interval_sec shouldn't change anything vs. the default floor: {len(loose_chunks)} != {len(default_chunks)}"
+    print("test_chunk_pairs_progress_interval_never_shrinks_below_worker_floor: OK")
+
+
 if __name__ == "__main__":
     test_load_all_scenes_parses_hex_to_int_and_groups_by_video()
     test_load_all_scenes_empty_table_returns_empty_dict()
     test_load_all_scenes_computes_duration_to_next_and_leaves_last_scene_none()
     test_load_all_scenes_drops_scenes_shorter_than_min_duration()
     test_load_all_audio_groups_by_video()
-    test_best_scene_match_finds_identical_hash_at_zero_distance()
-    test_best_scene_match_rejects_over_threshold()
-    test_best_scene_match_carries_scene_durations_through()
+    test_score_scenes_finds_identical_hash_at_zero_distance()
+    test_score_scenes_rejects_over_threshold()
+    test_score_scenes_carries_scene_durations_through()
+    test_score_scenes_empty_side_returns_empty_list()
+    test_score_scenes_color_guard_rejects_distant_color_even_at_zero_hash_distance()
     test_score_pair_missing_scenes_returns_none()
     test_score_pair_perfect_visual_match_no_audio()
     test_score_pair_single_match_has_zero_spread()
@@ -245,5 +370,10 @@ if __name__ == "__main__":
     test_chunk_pairs_empty_list()
     test_chunk_pairs_covers_every_pair_exactly_once_in_order()
     test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing()
+    test_chunk_pairs_with_cost_fn_covers_every_pair_exactly_once()
+    test_chunk_pairs_with_cost_fn_balances_better_than_equal_count_slicing()
+    test_chunk_pairs_with_cost_fn_reuses_pair_tuples_no_per_pair_allocation()
+    test_chunk_pairs_progress_interval_increases_chunk_count_for_large_pair_counts()
+    test_chunk_pairs_progress_interval_never_shrinks_below_worker_floor()
     TMP_DB.unlink(missing_ok=True)
     print("\nAll match-scoring tests passed.")

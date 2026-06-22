@@ -372,6 +372,15 @@
       match: 'Matching — scoring candidate pairs',
     };
 
+    // What stage_done actually counts, per stage — used in the
+    // "estimating…" message below. Inventory/fingerprint count files;
+    // match counts candidate pairs, not files.
+    const STAGE_UNITS = {
+      inventory: 'files',
+      fingerprint: 'files',
+      match: 'pairs',
+    };
+
     async function pollScanStatus() {
       const r = await fetch('/api/scan/status');
       const d = await r.json();
@@ -420,7 +429,8 @@
           etaEl.textContent = `ETA ~${fmtDuration(d.eta_sec)} remaining ` +
             `(est. total ${fmtDuration(totalSec)}, ends ~${endTime.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})})`;
         } else if ((d.stage_done || 0) === 0) {
-          etaEl.textContent = 'estimating… (no files finished yet this stage)';
+          const unit = STAGE_UNITS[d.stage] || 'items';
+          etaEl.textContent = `estimating… (no ${unit} finished yet this stage)`;
         } else {
           etaEl.textContent = '';
         }
