@@ -1,5 +1,209 @@
 # Changelog
 
+## 2026-06-23 — 0.13.1
+
+- **Confirmed live against the real library: `--pool-generation-chunks`
+  does not fix the memory-growth problem, and makes the peak worse.**
+  `cgroup_anon` reached ~10.7GB (vs. ~8GB with no pool recreation at
+  all), oscillating in the 9.4-10.7GB range for a sustained stretch
+  before completing (runtime unaffected: 439s). No confident explanation
+  yet for why teardown/recreation produces a *higher* peak. Left at
+  default (disabled) — not recommended for use. 
+- **Researched whether the underlying `max_tasks_per_child` CPython bug
+  is version-specific** (could upgrading/downgrading Python avoid it?):
+  no. Confirmed via the GitHub API that
+  [cpython#115634](https://github.com/python/cpython/issues/115634) —
+  describing the exact hang signature hit here — is still open with
+  comments as recent as May 2026, and that the original
+  [cpython#90622](https://github.com/python/cpython/issues/90622) fix
+  PR was never merged. Spans every Python version with this feature
+  (3.11 onward); no fix landed or imminent even for 3.15. 
+- **Condensed README's Tuning section significantly** for `03_match.py`'s
+  memory-growth investigation — was a step-by-step blow-by-blow of every
+  attempted fix; now a short summary mentioning the CPython bug and its
+  effect.
+- **Added a "Benchmarks" section to README** with real numbers from one
+  specific test machine (AMD Ryzen 7 7840HS / Radeon 780M / 32GB RAM):
+  matching-stage timing and memory before/after vectorization, and a
+  qualitative note that 4 fingerprint workers tested faster than 6 or 8.
+  Fingerprinting CPU-vs-GPU decode timing is explicitly flagged as not
+  yet benchmarked (only correctness has been validated) rather than
+  guessed at.
+
+## 2026-06-22 — 0.13.0
+
+- **`_record_candidate` (0.12.5) confirmed live to also not be the
+  dominant memory driver**: same ~2.7GB → ~5.5GB → ~8GB curve as every
+  attempt before it, on the real ~5000-video library. The fix itself is
+  still correct and kept (it removes genuinely unbounded growth and is a
+  real efficiency win), it just wasn't the multi-GB story.
+- **Found the actual mechanism, via a new `--debug-memory-objects`
+  diagnostic** (logs each worker's `gc.get_objects()` count and peak
+  RSS every 10 chunks): confirmed live that neither the main process's
+  RSS nor any individual worker's RSS grows over a run — all 15 workers'
+  full lifetimes traced, each plateauing within its first 1-3 chunks
+  (~5MB total) and then sitting completely flat for the rest of its life
+  (up to 816,149 further pairs processed with zero further RSS growth).
+  `gc.get_objects()` per worker also stays flat — ruling out a
+  Python-level reference leak entirely. Yet the cgroup-wide total climbs
+  the whole run. The only mechanism that reconciles "every process's own
+  memory size is flat" with "the aggregate keeps climbing" is
+  copy-on-write divergence: pages that started out genuinely shared
+  across the main process and all 15 workers gradually become
+  exclusively-owned private copies, one worker at a time, as each one's
+  `scenes_by_video.get(id)` calls touch (dirtying the page of) more of
+  the ~4765 `VideoScenes` container objects over its lifetime. A touched
+  page's size doesn't change for the worker now privately holding it —
+  so no individual RSS reading moves — but the cgroup's distinct-page
+  count goes up every time another worker's copy diverges from the
+  others. This also retroactively explains why `malloc_trim()`/
+  `gc.collect()` did nothing (no freed memory here to reclaim — live,
+  referenced pages losing shared status isn't garbage) and why
+  `--max-tasks-per-child` was conceptually the *right* idea (a fresh
+  fork gets fresh sharing) just implemented via a buggy mechanism.
+- **Added `--pool-generation-chunks`**: periodically does a full, clean
+  `shutdown(wait=True)` of the entire `ProcessPoolExecutor` and
+  constructs a brand new one, re-forking fresh workers from the main
+  process and restoring full sharing. Unlike `--max-tasks-per-child`'s
+  in-place worker replacement (forks a replacement while the pool's own
+  management thread is alive — the unresolved CPython bug), this fully
+  joins the old pool, including its management thread, before
+  constructing a new one — going through `ProcessPoolExecutor`'s
+  initial-launch code path instead of its dynamic-replacement one.
+  Verified correctness live: forcing pool recreation every 2 chunks
+  against a seeded DB still produced the right match counts, and the
+  only row-level differences from the sequential path were exact
+  `combined_score` ties at the eviction boundary — confirmed to be
+  pre-existing, inherent to the parallel path's already-nondeterministic
+  arrival order (the *same* kind of tie-breaking discrepancy, in fact
+  more of it, occurs with the existing single-pool parallel path too,
+  with or without this change).
+- **Not yet validated**: whether this actually keeps memory bounded over
+  a real full-length run on the real library — that's the next live
+  test, same protocol as every memory-related change tonight.
+
+## 2026-06-22 — 0.12.5
+
+- **`--trim-worker-memory` (0.12.4) confirmed live to not fix the memory
+  growth**: total runtime went *up* ~27% (7.5min → 9.5min) while memory
+  growth and the final ~8GB ceiling were essentially unchanged from
+  before — periodic small drops were visible (so the call does
+  *something*), but the dominant driver clearly lives outside the
+  workers. Now off by default (opt-in via `--trim-worker-memory`) rather
+  than always-on, kept available rather than deleted in case it's worth
+  re-testing once the real fix below is also in play.
+- **Found and fixed the actual dominant driver**: `results_by_preview`
+  in `03_match.py`'s `main()` accumulated *every* pair that passed the
+  visual-score/matched-scenes/spread thresholds for the *entire run*, in
+  the *main* process, only sorting and trimming to `--top-n` once at the
+  very end. A worker-side fix could never have touched this. A rough
+  size estimate (a `(candidate_id, res)` entry with ~5 matched scenes is
+  ~2.5KB) makes the magnitude plausible: at 11.7M pairs, even a modest
+  pass rate against `--min-visual-score`'s fairly loose 0.15 default
+  means millions of accumulated entries, squarely in the observed
+  multi-GB range.
+- **Added `_record_candidate()`**: maintains a bounded (≤`--top-n` per
+  preview) min-heap as results stream in, evicting the worst candidate
+  immediately when a better one arrives, instead of holding every
+  passing candidate until the end. Verified live with a seeded DB
+  containing more passing candidates than `--top-n` for one preview (8
+  candidates with distinct scores, `--top-n 5`): correctly kept only the
+  5 highest-scoring ones, identically under `--workers 1` and
+  `--workers 3`. Also unit-tested: bounded size, correct eviction,
+  tie-breaking at the eviction boundary matches the old
+  stable-sort-then-slice behavior (earlier arrival wins).
+- **Not yet validated**: whether this actually keeps memory bounded over
+  a real full-length run on the real ~5000-video library — the next
+  real match run should confirm via `docker stats`/`free -m` watched
+  throughout, same as every memory-related change to this stage so far.
+
+## 2026-06-22 — 0.12.4
+
+- **Added a safer alternative for the memory-growth problem
+  `--max-tasks-per-child` was meant to fix** (0.12.2, reverted in
+  0.12.3 after deadlocking a production run): `_trim_worker_memory()`,
+  called at the end of every `_score_chunk()` in `03_match.py`. Calls
+  glibc's `malloc_trim(0)` via `ctypes` (preceded by `gc.collect()` so
+  CPython's own small-object allocator can release empty arenas back to
+  glibc first), asking the allocator to hand freed memory back to the OS
+  instead of retaining it for reuse. No process replacement, no fork, no
+  new thread — runs entirely within the same already-alive worker
+  process, so it carries none of `--max-tasks-per-child`'s deadlock risk
+  (that risk was specifically about *forking a replacement* while
+  `ProcessPoolExecutor`'s management thread is alive; this never forks
+  at all). No-op on non-glibc platforms. Always on for `--workers > 1`,
+  no new flag.
+- Verified live that this doesn't change scoring results: `--workers 1`
+  vs `--workers 3` (with `--progress-interval` near-zero, forcing the
+  trim call on every single chunk rather than just occasionally) against
+  identical seeded DBs still produced byte-identical `matches` rows.
+- **Not yet validated**: whether this actually keeps memory bounded over
+  a real full-length run on the real ~5000-video library — the next
+  real match run should confirm via `docker stats`/`free -m` watched
+  throughout, same as every memory-related change to this stage so far.
+
+## 2026-06-22 — 0.12.3
+
+- **Reverted 0.12.2's `--max-tasks-per-child` default to disabled (0)
+  after it deadlocked a real production run.** Workers bled out to zero
+  with no error in any log (docker logs, debug log) and the run hung
+  forever; `docker top` showed 18 threads in the main process where ~2
+  are expected. Root cause confirmed directly in this Python version's
+  own `concurrent/futures/process.py` source: `_adjust_process_count`
+  forks a replacement worker while `ProcessPoolExecutor`'s own
+  background management thread (`_ExecutorManagerThread`) is still
+  running — a known, **unresolved** CPython bug
+  ([cpython#90622](https://github.com/python/cpython/issues/90622)),
+  acknowledged in that exact function's own source comment ("there is
+  still a potential deadlock bug"). Forking a multi-threaded parent is a
+  classic hazard: a lock held by some thread other than the one calling
+  fork() stays locked forever in the child, since that thread doesn't
+  exist there to release it. This is a property of the default `fork`
+  multiprocessing start method (which this script always uses — `spawn`
+  would mean re-pickling and re-sending the entire preloaded scene
+  dataset over IPC for every worker, including the initial ones,
+  defeating the copy-on-write sharing this stage relies on), not
+  something fixable by configuring `max_tasks_per_child` differently.
+  `--max-tasks-per-child` now defaults to 0 (never recycle, the original
+  behavior) and its help text/docstring warn against enabling it.
+- The underlying memory-growth problem `--max-tasks-per-child` was
+  trying to fix (glibc/numpy allocator retention, not a real leak — see
+  0.12.2) is still real and still unaddressed. Next candidate: a
+  periodic `malloc_trim()` call from *within* each long-lived worker (no
+  process replacement, no fork, no thread-safety hazard) — not yet
+  implemented.
+
+## 2026-06-22 — 0.12.2
+
+- **Confirmed live**: 0.12.0's vectorization fix sped up a real
+  ~11.7M-pair/5000-video match run from ~16.5min to ~7.5min at 15
+  workers, and fixed the shared-base-data-staying-shared half of the
+  prior incident's likely cause (each worker's individual RSS was close
+  to the pool's *total* `docker stats` figure — the shared preloaded
+  scene data was genuinely counted once across the pool, not duplicated
+  per worker).
+- **Found a second, separate memory issue from the same live run**:
+  total memory still climbed steadily throughout (~2.9GB shortly after
+  starting → ~5.4GB at 50% progress → ~8GB near completion), dropping to
+  baseline (~42MB) the instant workers exited. That drop-on-exit, plus
+  no code path that accumulates state across pairs/chunks, points to
+  glibc/numpy allocator retention from millions of small per-pair
+  temporary-array/result-dict allocations, not a Python-level reference
+  leak.
+- **Added `--max-tasks-per-child`** (`03_match.py`, default 20,
+  `--workers > 1` only): recycles a worker process after this many
+  chunks, via `ProcessPoolExecutor`'s built-in support for exactly this
+  pattern. A recycled worker re-forks fresh from the same long-lived
+  main process — cheap, and it still gets the shared base data via
+  copy-on-write — so only that worker's own accumulated private growth
+  resets. `0` disables recycling. Verified live that recycling doesn't
+  lose or duplicate work: forcing recycling after *every single chunk*
+  (`--max-tasks-per-child 1`) against a seeded DB still produced
+  byte-identical `matches` rows vs. the sequential (`--workers 1`) path.
+  **Not yet validated**: whether 20 actually keeps memory bounded over a
+  real full-length run — the next real match run should confirm via
+  `docker stats`/`free -m` watched throughout.
+
 ## 2026-06-22 — 0.12.1
 
 - **Added `--progress-interval`** (`03_match.py`, default 10.0 seconds,
@@ -187,10 +391,7 @@
 
 - **Prepared for git/GitHub**: removed deployment-identifying details
   (hostname, IP, specific library-tool naming, GPU model) from every
-  comment and doc that gets committed — `CLAUDE.md` (written with real
-  deployment specifics for Claude Code's own use) and the real
-  `docker-preview-matcher.yml` compose override are gitignored instead
-  of scrubbed, since they're not meant to be published at all.
+  comment and doc that gets committed.
   `docker-compose.yml` is now a generic, commented sample meant to be
   copied and filled in; `rebuild.sh` uses `docker-preview-matcher.yml`
   if present, falling back to the sample otherwise. The Dockerfile no
@@ -453,9 +654,7 @@
   live decrease, with every task still running to completion.
 - Both `02_fingerprint.py` and `03_match.py`'s scan-panel "Start scan"
   controls gained optional worker-count inputs (fingerprint workers,
-  match workers), threaded through `_build_cmd` — see `CLAUDE.md`'s
-  warning about this exact spot being where the `--hwaccel` checkbox
-  silently no-op'd for a whole release (0.2.0).
+  match workers), threaded through `_build_cmd`.
 - `scan_runs` gained a `target_workers` column via an explicit
   `ALTER TABLE` migration in `init_db()` (the table already existed in
   deployed DBs, so `CREATE TABLE IF NOT EXISTS` alone wouldn't add it) —

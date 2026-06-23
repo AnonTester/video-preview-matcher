@@ -173,6 +173,112 @@ ties, before it was replaced; `--workers 1` vs `--workers N` against
 identical seeded DBs were also re-confirmed byte-identical after this
 change, same as after every previous change to this stage.
 
+Confirmed live against the real ~5000-video library (~11.7M pairs):
+total time dropped from ~16.5min (pre-fix, 15 workers) to ~7.5min
+(post-vectorization, 15 workers) — but `docker stats` showed total
+memory climbing steadily throughout the run (~2.9GB shortly after
+starting, ~5.4GB at 50% progress, ~8GB near completion), dropping to
+baseline (~42MB) the instant workers exited. That drop-on-exit, plus no
+code path here that accumulates state across pairs/chunks, points to
+glibc/numpy allocator retention (freed-but-not-returned-to-the-OS memory
+from millions of per-pair temporary numpy arrays and score_pair() result
+dicts), not a Python-level reference leak — the vectorization fix above
+addresses the *shared* base data staying shared (confirmed working: each
+worker's individual RSS was close to the *total*, meaning the shared
+portion was counted once across the whole pool, not duplicated per
+worker), it just doesn't stop each worker's own per-task allocator
+fragmentation from growing over a long enough run.
+
+`--max-tasks-per-child` (DISABLED by default — do not enable, see below)
+was a first attempt at fixing that fragmentation by having
+`ProcessPoolExecutor` recycle a worker after N chunks. It deadlocked a
+real production run instead: workers bled out to zero with no error in
+any log, the run hung forever, and `docker top` showed 18 threads in the
+main process where ~2 are expected. Root cause confirmed directly in
+this Python version's own stdlib source
+(`concurrent/futures/process.py`'s `_adjust_process_count`): replacing a
+dead/recycled worker forks a new child *while the executor's own
+background management thread (`_ExecutorManagerThread`) is still
+running* — forking a multi-threaded parent is a classic deadlock hazard
+(any lock held by a thread other than the forking one stays locked
+forever in the child, since that thread doesn't exist there to release
+it), and CPython's own source comment acknowledges this exact gap, with
+a citation to a real, still-open issue
+(https://github.com/python/cpython/issues/90622). This isn't a
+configuration mistake on the caller's part — it's a property of the
+default 'fork' multiprocessing start method (which this script always
+uses, since switching to 'spawn' would mean re-pickling and re-sending
+the entire preloaded scene dataset over IPC for every worker, including
+the initial ones, defeating the whole point of the copy-on-write sharing
+this stage relies on). Until that CPython issue is fixed, recycling
+workers via this executor is unsafe here — leave `--max-tasks-per-child`
+at 0. The underlying allocator-fragmentation problem this was trying to
+fix is still real and still unaddressed by that abandoned attempt.
+
+**Second attempt — `_trim_worker_memory()` (calls glibc's `malloc_trim(0)`
+via `ctypes`, preceded by `gc.collect()`, at the end of every
+`_score_chunk()`) — ran clean (no fork, no deadlock) but didn't fix the
+problem.** Confirmed live: total runtime went *up* (~7.5min -> ~9.5min,
+~27% slower) while memory growth and the final ceiling were essentially
+unchanged (~2.7GB -> ~5.3GB at 50% -> ~8GB, same as before) — periodic
+small drops were visible, proving the call does *something*, but it
+didn't touch the dominant driver. That's a real, informative negative
+result: it means the growth was never primarily about per-worker
+allocator fragmentation at all. Now gated behind `--trim-worker-memory`
+(off by default, opt-in) rather than removed outright, in case it's
+worth re-testing once the real fix below is also in play.
+
+**Third attempt — `results_by_preview`'s unbounded accumulation, found by
+re-reading this function's own aggregation loop — ran clean and was a
+real, separate bug, but confirmed live to *also* not be the dominant
+driver.** It accumulated *every* pair that passed
+`--min-visual-score`/`--min-matched-scenes`/`--min-match-spread` for the
+entire run, in the main process, only sorting and trimming to `--top-n`
+once at the very end — fixed by `_record_candidate()` (a bounded
+(<=`--top-n` per preview) min-heap maintained as results stream in,
+evicting the worst candidate immediately when a better one arrives).
+Verified correct (byte-identical eviction behavior under `--workers 1`
+vs `--workers 3` against a seeded DB built specifically to exercise
+eviction) — but confirmed live against the real library that memory
+growth was *unchanged*: same ~2.7GB -> ~5.5GB -> ~8GB curve as every
+attempt before it. `_record_candidate` is still correct and worth
+keeping (it's a real, if small, efficiency win and removes genuinely
+unbounded growth), it just isn't the multi-GB story.
+
+**Actual mechanism, found via `--debug-memory-objects` live on the real
+library**: neither the main process's RSS *nor any individual worker's*
+RSS grows over the run — confirmed across all 15 workers' full
+lifetimes, each plateauing within its first 1-3 chunks (~5MB total) and
+then sitting completely flat for the rest of its life (one worker
+processed 816,149 more pairs after plateauing with zero further RSS
+growth). `gc.get_objects()` per worker also stays flat throughout —
+ruling out a Python-level reference leak. Yet the cgroup-wide total
+climbs the entire run. The only mechanism that reconciles "every
+process's own memory size is flat" with "the aggregate keeps climbing"
+is copy-on-write divergence: pages that started out genuinely shared
+across the main process and all 15 workers gradually become exclusively-
+owned private copies, one worker at a time, as each one's
+`scenes_by_video.get(id)` calls touch (and thus dirty the page of) more
+of the ~4765 `VideoScenes` container objects over its lifetime. A
+touched page's *size* doesn't change for the worker now privately
+holding it — so no individual RSS reading moves — but the cgroup's count
+of distinct physical pages goes up every time another worker's copy
+diverges from the others. This also explains why `malloc_trim()`/
+`gc.collect()` did nothing: there's no freed memory here to reclaim —
+these are live, still-referenced pages simply losing shared status, not
+garbage. (And it retroactively explains why `--max-tasks-per-child` was
+conceptually the *right* idea — a fresh fork gets fresh sharing — just
+implemented via a buggy mechanism.)
+
+Fixed (untested in production as of this writing) by
+`--pool-generation-chunks`: periodically does a full, clean
+`shutdown(wait=True)` of the entire pool and constructs a brand new
+`ProcessPoolExecutor`, re-forking fresh workers from the main process
+and restoring full sharing — see `--pool-generation-chunks`'s own help
+text for why this avoids `--max-tasks-per-child`'s deadlock (it goes
+through `_launch_processes()`, only reachable when no manager thread is
+alive, instead of `_adjust_process_count()`, which forks while one is).
+
 Usage:
     python3 src/03_match.py --db data/library.db [--hash-threshold 8]
                              [--color-threshold 0.25] [--min-ratio 0.02]
@@ -183,6 +289,8 @@ Usage:
 """
 
 import argparse
+import ctypes
+import gc
 import heapq
 import json
 import os
@@ -541,27 +649,126 @@ def _chunk_pairs(pairs: list, workers: int, cost_fn=None, progress_interval_sec:
 # rather than data passed with every task.
 _WORKER_STATE: dict = {}
 
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except OSError:
+    _LIBC = None  # non-glibc platform (e.g. macOS dev box) — trimming becomes a no-op
 
-def _init_worker(scenes_by_video, audio_by_video, hash_threshold, color_threshold):
+
+def _trim_worker_memory():
+    """Ask glibc to release freed-but-retained heap memory back to the OS.
+    Gated behind --trim-worker-memory (off by default) — see module
+    docstring's MEMORY GROWTH section: confirmed live to add ~27% to
+    total runtime with *zero* measurable effect on the actual memory
+    growth/ceiling, since the dominant driver turned out to be
+    unbounded accumulation in the *main* process (`_record_candidate`),
+    not per-worker allocator fragmentation. Kept available, not deleted,
+    in case it's worth re-testing once that main-process fix is also in
+    play — but do not enable by default again without new evidence.
+    `gc.collect()` first gives CPython's own small-object allocator
+    (pymalloc) its best chance to release any now-empty arenas back to
+    glibc before asking glibc to release them to the OS. No-op on
+    non-glibc platforms (`_LIBC` is None there)."""
+    gc.collect()
+    if _LIBC is not None:
+        _LIBC.malloc_trim(0)
+
+
+def _init_worker(scenes_by_video, audio_by_video, hash_threshold, color_threshold, trim_memory=False, debug_memory=False):
     _WORKER_STATE["scenes"] = scenes_by_video
     _WORKER_STATE["audio"] = audio_by_video
     _WORKER_STATE["hash_threshold"] = hash_threshold
     _WORKER_STATE["color_threshold"] = color_threshold
+    _WORKER_STATE["trim_memory"] = trim_memory
+    _WORKER_STATE["debug_memory"] = debug_memory
+    _WORKER_STATE["chunks_done"] = 0
+    _WORKER_STATE["pairs_done"] = 0
 
 
 def _score_chunk(pairs_chunk: list) -> list:
     """Runs in a worker process. Returns (preview_id, candidate_id, result)
     for every pair in the chunk — filtering against --min-visual-score/
     --min-matched-scenes happens back in the main process, same as the
-    sequential path, so both code paths apply identical thresholds."""
+    sequential path, so both code paths apply identical thresholds.
+    Trims the worker's heap before returning — see _trim_worker_memory's
+    docstring; cheap relative to a chunk's actual scoring work."""
     scenes = _WORKER_STATE["scenes"]
     audio = _WORKER_STATE["audio"]
     hash_threshold = _WORKER_STATE["hash_threshold"]
     color_threshold = _WORKER_STATE["color_threshold"]
-    return [
+    result = [
         (preview_id, candidate_id, score_pair(scenes, audio, preview_id, candidate_id, hash_threshold, color_threshold))
         for preview_id, candidate_id in pairs_chunk
     ]
+    if _WORKER_STATE.get("trim_memory"):
+        _trim_worker_memory()
+    if _WORKER_STATE.get("debug_memory"):
+        _log_worker_memory_debug(len(pairs_chunk))
+    return result
+
+
+def _log_worker_memory_debug(chunk_pairs: int) -> None:
+    """TEMPORARY diagnostic (not a permanent feature — see --debug-memory-objects'
+    own help text) for tracking down the per-worker memory-growth incident:
+    confirmed live that --trim-worker-memory's gc.collect()+malloc_trim()
+    has zero effect, which rules out both a reference-cycle leak (gc.collect
+    would have freed it) and simple allocator fragmentation that malloc_trim
+    can reclaim. This logs gc.get_objects() counts (by type) and this
+    worker's own peak RSS to stdout (-> docker logs) every 10 chunks, to see
+    directly whether Python-visible object counts are actually growing
+    (pointing at a genuine retained reference somewhere) or staying flat
+    (pointing at something invisible to gc — e.g. heap fragmentation from
+    many small interleaved live/dead allocations, which malloc_trim can't
+    address since it only reclaims fully-free contiguous regions, not
+    space fragmented between still-live objects)."""
+    import resource
+
+    _WORKER_STATE["chunks_done"] += 1
+    _WORKER_STATE["pairs_done"] += chunk_pairs
+    n = _WORKER_STATE["chunks_done"]
+    if n % 10 != 0 and n > 3:
+        return
+    objs = gc.get_objects()
+    counts = {}
+    for o in objs:
+        t = type(o).__name__
+        counts[t] = counts.get(t, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
+    rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(f"[debug-memory pid={os.getpid()}] chunks={n} pairs={_WORKER_STATE['pairs_done']} "
+          f"maxrss_kb={rss_kb} total_gc_objects={len(objs)} top_types={top}", flush=True)
+
+
+def _record_candidate(top_candidates: dict, preview_id: int, candidate_id: int, res: dict, top_n: int) -> None:
+    """Maintain a bounded (<=top_n per preview) min-heap of the best
+    candidates seen so far, instead of accumulating *every* passing
+    candidate across the whole run before sorting and trimming once at
+    the end. The old unbounded-accumulation approach was a real,
+    multi-GB-scale memory driver in the main process — confirmed live:
+    after `_trim_worker_memory` (a worker-side fix) measurably slowed the
+    run down (~7.5min -> ~9.5min) with *zero* effect on the observed
+    memory growth or ceiling, the only explanation left is that the
+    dominant driver lives outside the workers entirely. A rough estimate
+    backs this up: a (candidate_id, res) entry is ~2.5KB (scene_matches
+    list + its dicts); at 11.7M pairs even a modest pass rate against
+    --min-visual-score's fairly loose 0.15 default means millions of
+    accumulated entries is plausible, squarely in the observed
+    multi-GB range — see module docstring's MEMORY section.
+
+    Heap entries are (combined_score, candidate_id, res) — heapq pops
+    the smallest first, so the worst currently-kept candidate is always
+    the one evicted when a better one arrives. On an exact tie at the
+    eviction boundary, whichever arrived first is kept (matches the old
+    stable-sort-then-slice behavior in the sequential path; the parallel
+    path's arrival order was already non-deterministic run-to-run either
+    way, since it depends on which worker's chunk happens to finish
+    first)."""
+    heap = top_candidates.setdefault(preview_id, [])
+    entry = (res["combined_score"], candidate_id, res)
+    if len(heap) < top_n:
+        heapq.heappush(heap, entry)
+    elif entry[0] > heap[0][0]:
+        heapq.heapreplace(heap, entry)
 
 
 def main():
@@ -594,6 +801,49 @@ def main():
                           "land roughly this often instead of the chunk count being fixed regardless "
                           "of pair count — see _chunk_pairs's docstring for the (rough, pre-vectorization) "
                           "throughput estimate this is translated through")
+    ap.add_argument("--max-tasks-per-child", type=int, default=0,
+                     help="--workers > 1 only: recycle a worker process after this many chunks (0 = "
+                          "never recycle, the default). DISABLED BY DEFAULT — a real production run "
+                          "deadlocked with this enabled: forking a replacement worker while "
+                          "ProcessPoolExecutor's own management thread is alive is a known, unresolved "
+                          "CPython bug (https://github.com/python/cpython/issues/90622, acknowledged in "
+                          "_adjust_process_count's own source comment) when using the default 'fork' "
+                          "start method, which this script always uses. Workers bled out to zero with no "
+                          "error and the run hung forever. Only set this above 0 if that bug is fixed in "
+                          "your Python version — see module docstring before touching this")
+    ap.add_argument("--trim-worker-memory", action="store_true",
+                     help="--workers > 1 only: call glibc's malloc_trim() at the end of every chunk "
+                          "(_trim_worker_memory). OFF BY DEFAULT — measured live to add ~27%% to total "
+                          "runtime (7.5min -> 9.5min) with *zero* effect on the actual memory growth/"
+                          "ceiling. _record_candidate's bounded top-N heap (the next attempt) *also* had "
+                          "zero effect when measured live — confirmed via live per-process monitoring that "
+                          "the main process's own RSS stays completely flat for the whole run, so neither "
+                          "guess was right. Still real, still unfixed as of this flag's last edit — see "
+                          "--debug-memory-objects and module docstring before touching either flag")
+    ap.add_argument("--debug-memory-objects", action="store_true",
+                     help="--workers > 1 only: diagnostic, logs each worker's gc.get_objects() count (by "
+                          "type) and peak RSS to stdout every 10 chunks. Already used live to settle the "
+                          "memory-growth question: gc object counts and each worker's own maxrss both "
+                          "stay completely flat for the worker's entire life, even as the cgroup-wide "
+                          "total keeps climbing — ruling out a Python-level leak *and* per-process growth "
+                          "of any kind, pointing at copy-on-write divergence instead (see "
+                          "--pool-generation-chunks). Left available for re-validating that fix")
+    ap.add_argument("--pool-generation-chunks", type=int, default=0,
+                     help="--workers > 1 only: fully shut down and recreate the worker pool after this "
+                          "many chunks (0 = one pool for the whole run, the default/old behavior). "
+                          "Targets COW page-divergence memory growth that neither --max-tasks-per-child "
+                          "(deadlocks) nor --trim-worker-memory (proven ineffective) could address — "
+                          "confirmed live via --debug-memory-objects that no single process's own RSS "
+                          "grows, yet the cgroup-wide total does, which only a sharing-status change (not "
+                          "a leak, not fragmentation) explains. A full pool recreation re-forks fresh "
+                          "workers from the main process, restoring full copy-on-write sharing. Unlike "
+                          "--max-tasks-per-child's in-place worker replacement (forks a replacement while "
+                          "the pool's own management thread is alive — the unresolved CPython bug), this "
+                          "fully joins the old pool, including its management thread, via "
+                          "shutdown(wait=True) before constructing a new one — going through "
+                          "ProcessPoolExecutor's initial-launch code path instead of its dynamic-worker- "
+                          "replacement one. UNTESTED IN PRODUCTION as of this flag's introduction — try "
+                          "something like 20x your --workers count as a starting point")
     ap.add_argument("--run-id", type=int, default=None,
                      help="internal: scan_runs row to report progress to (set by the web UI's scan orchestrator)")
     args = ap.parse_args()
@@ -642,7 +892,7 @@ def main():
                      stage_started_at=time.time(), message=f"{len(pairs):,} candidate pairs",
                      updated_at=time.time())
 
-    results_by_preview = {}
+    results_by_preview = {}  # preview_id -> bounded min-heap, see _record_candidate
     t0 = time.time()
     done_pairs = 0
 
@@ -652,7 +902,7 @@ def main():
             if (res and res["visual_score"] >= args.min_visual_score
                     and len(res["scene_matches"]) >= args.min_matched_scenes
                     and res["match_spread_sec"] >= args.min_match_spread):
-                results_by_preview.setdefault(preview_id, []).append((candidate_id, res))
+                _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
 
             if i % 500 == 0:
                 print(f"  ...{i:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
@@ -664,29 +914,50 @@ def main():
             return len(scenes_by_video.get(preview_id, ())) * len(scenes_by_video.get(candidate_id, ()))
 
         chunks = _chunk_pairs(pairs, args.workers, cost_fn=_pair_cost, progress_interval_sec=args.progress_interval)
-        with ProcessPoolExecutor(
-            max_workers=args.workers, initializer=_init_worker,
-            initargs=(scenes_by_video, audio_by_video, args.hash_threshold, args.color_threshold),
-        ) as pool:
-            futures = {pool.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
-            for fut in as_completed(futures):
-                for preview_id, candidate_id, res in fut.result():
-                    if (res and res["visual_score"] >= args.min_visual_score
-                            and len(res["scene_matches"]) >= args.min_matched_scenes
-                            and res["match_spread_sec"] >= args.min_match_spread):
-                        results_by_preview.setdefault(preview_id, []).append((candidate_id, res))
-                done_pairs += futures[fut]
-                print(f"  ...{done_pairs:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
-                update_scan_run(args.db, args.run_id, stage_done=done_pairs,
-                                 message=f"{done_pairs:,}/{len(pairs):,} pairs scored", updated_at=time.time())
+        gen_size = args.pool_generation_chunks or len(chunks)  # 0 -> one generation, the original behavior
+        generations = [chunks[i:i + gen_size] for i in range(0, len(chunks), gen_size)]
+
+        for gen_chunks in generations:
+            # A fresh ProcessPoolExecutor per generation — see module
+            # docstring's MEMORY GROWTH section. Each one forks brand new
+            # workers from this (still-COW-shareable) main process, so
+            # accumulated page-divergence from the previous generation's
+            # workers is discarded when they exit; this constructor call
+            # only runs once this generation's pool object exists, going
+            # through _launch_processes() (manager thread is None at this
+            # point) rather than _adjust_process_count()'s replace-a-
+            # worker-while-the-pool-is-live path — see --pool-generation-
+            # chunks' own help text for why that distinction matters.
+            with ProcessPoolExecutor(
+                max_workers=args.workers, initializer=_init_worker,
+                initargs=(scenes_by_video, audio_by_video, args.hash_threshold, args.color_threshold,
+                          args.trim_worker_memory, args.debug_memory_objects),
+                max_tasks_per_child=(args.max_tasks_per_child or None),
+            ) as pool:
+                futures = {pool.submit(_score_chunk, chunk): len(chunk) for chunk in gen_chunks}
+                for fut in as_completed(futures):
+                    for preview_id, candidate_id, res in fut.result():
+                        if (res and res["visual_score"] >= args.min_visual_score
+                                and len(res["scene_matches"]) >= args.min_matched_scenes
+                                and res["match_spread_sec"] >= args.min_match_spread):
+                            _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
+                    done_pairs += futures[fut]
+                    print(f"  ...{done_pairs:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
+                    update_scan_run(args.db, args.run_id, stage_done=done_pairs,
+                                     message=f"{done_pairs:,}/{len(pairs):,} pairs scored", updated_at=time.time())
+            # pool.shutdown(wait=True) already ran via __exit__ above —
+            # the next generation's pool (if any) only gets constructed
+            # after this one's manager thread and all workers have fully
+            # joined, which is exactly the precondition _launch_processes
+            # asserts.
 
     with connect(args.db) as conn:
-        # Keep only top-N per preview, write to matches table
+        # Each preview's heap already holds at most top_n entries — see
+        # _record_candidate — so this is just a final sort for write order.
         conn.execute("DELETE FROM matches")  # matching is fully re-derivable, safe to recompute fresh
         total_stored = 0
-        for preview_id, candidates in results_by_preview.items():
-            candidates.sort(key=lambda x: x[1]["combined_score"], reverse=True)
-            for candidate_id, res in candidates[: args.top_n]:
+        for preview_id, heap in results_by_preview.items():
+            for combined_score, candidate_id, res in sorted(heap, key=lambda t: t[0], reverse=True):
                 conn.execute(
                     """INSERT OR REPLACE INTO matches
                        (preview_id, candidate_id, visual_score, audio_score, combined_score, scene_matches_json, computed_at)

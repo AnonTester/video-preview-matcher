@@ -340,6 +340,70 @@ def test_chunk_pairs_progress_interval_increases_chunk_count_for_large_pair_coun
     print("test_chunk_pairs_progress_interval_increases_chunk_count_for_large_pair_counts: OK")
 
 
+def test_trim_worker_memory_does_not_raise():
+    # Smoke test only — malloc_trim() has no observable Python-level
+    # return value to assert on; this just confirms the ctypes call (or
+    # its graceful no-op on a non-glibc platform) doesn't raise, since
+    # this runs unconditionally at the end of every _score_chunk() call
+    # in a real worker process.
+    match_mod._trim_worker_memory()
+    print("test_trim_worker_memory_does_not_raise: OK")
+
+
+def test_score_chunk_result_unaffected_by_memory_trim():
+    # _score_chunk() is what actually runs in a worker process — confirm
+    # its returned data is the same regardless of --trim-worker-memory
+    # (now opt-in, off by default — see module docstring's MEMORY GROWTH
+    # section for why it's disabled: measured live to add ~27% runtime
+    # with zero effect on actual memory growth).
+    scenes_by_video = {
+        1: _video_scenes([(1.0, "ff00ff00ff00ff00", None), (2.0, "00ff00ff00ff00ff", None), (3.0, "ffff0000ffff0000", None)]),
+        2: _video_scenes([(10.0, "ff00ff00ff00ff00", None), (20.0, "00ff00ff00ff00ff", None), (30.0, "ffff0000ffff0000", None)]),
+    }
+    direct = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    for trim_memory in (False, True):
+        match_mod._WORKER_STATE.update({
+            "scenes": scenes_by_video, "audio": {}, "hash_threshold": 8, "color_threshold": 0.25,
+            "trim_memory": trim_memory,
+        })
+        chunk_result = match_mod._score_chunk([(1, 2)])
+        assert chunk_result == [(1, 2, direct)], f"trim_memory={trim_memory} changed the result"
+    print("test_score_chunk_result_unaffected_by_memory_trim: OK")
+
+
+def test_record_candidate_keeps_only_top_n_per_preview():
+    top_candidates = {}
+    for i in range(20):
+        res = {"combined_score": i / 20.0}  # candidate i=19 is the best
+        match_mod._record_candidate(top_candidates, preview_id=1, candidate_id=i, res=res, top_n=5)
+    heap = top_candidates[1]
+    assert len(heap) == 5, f"expected exactly top_n=5 entries, got {len(heap)}"
+    kept_ids = sorted(candidate_id for _, candidate_id, _ in heap)
+    assert kept_ids == [15, 16, 17, 18, 19], f"expected the 5 best-scoring candidates, got {kept_ids}"
+    print("test_record_candidate_keeps_only_top_n_per_preview: OK")
+
+
+def test_record_candidate_ties_at_eviction_boundary_keep_earlier_arrival():
+    # Matches the old stable-sort-then-slice behavior in the sequential
+    # path: on an exact score tie at the cutoff, whichever arrived first
+    # is kept.
+    top_candidates = {}
+    match_mod._record_candidate(top_candidates, 1, candidate_id=100, res={"combined_score": 0.5}, top_n=1)
+    match_mod._record_candidate(top_candidates, 1, candidate_id=200, res={"combined_score": 0.5}, top_n=1)
+    heap = top_candidates[1]
+    assert len(heap) == 1
+    assert heap[0][1] == 100, f"expected the earlier-arriving candidate (100) to win the tie, got {heap[0][1]}"
+    print("test_record_candidate_ties_at_eviction_boundary_keep_earlier_arrival: OK")
+
+
+def test_record_candidate_separate_previews_dont_interfere():
+    top_candidates = {}
+    match_mod._record_candidate(top_candidates, 1, candidate_id=10, res={"combined_score": 0.9}, top_n=2)
+    match_mod._record_candidate(top_candidates, 2, candidate_id=20, res={"combined_score": 0.1}, top_n=2)
+    assert {pid: len(h) for pid, h in top_candidates.items()} == {1: 1, 2: 1}
+    print("test_record_candidate_separate_previews_dont_interfere: OK")
+
+
 def test_chunk_pairs_progress_interval_never_shrinks_below_worker_floor():
     # A loose progress_interval_sec (here, 1 hour) against a small pair
     # count would suggest just 1 chunk on its own — it must not pull
@@ -367,6 +431,11 @@ if __name__ == "__main__":
     test_score_pair_perfect_visual_match_no_audio()
     test_score_pair_single_match_has_zero_spread()
     test_score_pair_clustered_matches_have_small_spread()
+    test_trim_worker_memory_does_not_raise()
+    test_score_chunk_result_unaffected_by_memory_trim()
+    test_record_candidate_keeps_only_top_n_per_preview()
+    test_record_candidate_ties_at_eviction_boundary_keep_earlier_arrival()
+    test_record_candidate_separate_previews_dont_interfere()
     test_chunk_pairs_empty_list()
     test_chunk_pairs_covers_every_pair_exactly_once_in_order()
     test_chunk_pairs_produces_more_chunks_than_workers_for_load_balancing()

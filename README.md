@@ -121,9 +121,7 @@ row just gets hidden from the active review queue (its matches won't
 show up, but nothing about them is touched) until it either reappears on
 its own or a human explicitly removes it via the queue page's "missing
 files" panel / `POST /api/missing-files/prune` (same explicit-confirm
-pattern as emptying the staging folder) — see `CLAUDE.md` for why
-auto-deleting on this signal would be dangerous against this library's
-NFS mount specifically.
+pattern as emptying the staging folder).
 
 ## Triggering scans from the web UI
 
@@ -305,36 +303,32 @@ calibrated values. Expect to spend real time here:
   "Triggering scans from the web UI" above — so it's worth experimenting
   with mid-run rather than guessing up front and restarting.
 
-- **`--workers`** (`03_match.py`, default cpu count − 1): unlike
-  fingerprinting, this stage has no I/O or GPU contention (pure in-memory
-  hash comparison after the preload — see 03_match.py's PERFORMANCE
-  docstring section), so more cores should mostly just help *CPU-wise*.
-  It was **not** free of shared-resource contention once RAM is
-  considered, though: every worker is a forked copy of the main process
-  and receives the full preloaded scene data. Linux's `fork()` normally
-  shares those pages copy-on-write, but CPython's reference counting
-  touches every object's refcount on any access (even a read), which
-  dirties the page and forces a private copy — with the old per-scene
-  Python-dict representation, every hash/timestamp lookup during scoring
-  was exactly such a touch, so each worker's RSS could creep up well past
-  its fair share over the course of a run, not just at startup. This
-  contributed to a real production incident (server required a hard
-  reboot — see CHANGELOG) on a ~5000-video library, much larger than the
-  ~2000-video scale this stage was last validated against. 0.12.0's
-  `VideoScenes`/`score_scenes` rewrite (numpy-vectorized, see
-  03_match.py's VECTORIZED SCORING docstring section) should fix this —
-  vectorized ops read the raw array buffer in C without touching a
-  per-element refcount, so those pages stay genuinely shared — but it
-  hasn't yet been confirmed against a real multi-minute run at full
-  library scale with RSS watched live. Until that's done, don't assume
-  `cpu_count - 1` is safe just because cores are free at large library
-  sizes — watch actual memory (`free -m`, `docker stats`) over a real
-  run, ideally starting with a reduced `--workers` and/or a
-  `--limit`-bounded subset. Exactly how much more cores help, and
-  whether leaving a core free (the default) vs. using every core matters
-  in practice, also hasn't been benchmarked for real yet. `--workers 1`
-  runs the old sequential path (no process pool, no preload duplication
-  at all) if you want a baseline.
+- **`--workers`** (`03_match.py`, default cpu count − 1): no I/O/GPU
+  contention (pure in-memory hashing after the preload), so more cores
+  should mostly help CPU-wise — but RAM is a separate, still-unresolved
+  story. On the real ~5000-video library, a full 15-worker run's memory
+  climbs steadily over the run (~2.7GB → ~5.5GB → ~8GB), dropping to
+  baseline the instant it finishes. This traces to copy-on-write
+  divergence: pages shared between the main process and every forked
+  worker gradually become private copies as each worker touches more of
+  the preloaded scene data — confirmed *not* a leak (no process's own
+  RSS or object count grows over a run) and not reclaimable by
+  `gc.collect()`/`malloc_trim()` (nothing's actually freed; shared pages
+  are just losing their shared status). The obvious fix — recycling
+  workers via `--max-tasks-per-child` — is unsafe: `ProcessPoolExecutor`
+  forks a replacement worker while its own background thread is still
+  alive, a real, currently unresolved CPython bug present in every
+  version with this feature (3.11 onward), not specific to the version
+  in use here —
+  [cpython#90622](https://github.com/python/cpython/issues/90622) and
+  [#115634](https://github.com/python/cpython/issues/115634) (open,
+  with active discussion as recently as May 2026 — a Python upgrade or
+  downgrade will not avoid it). Leave `--max-tasks-per-child` at `0`.
+  `--pool-generation-chunks` (periodic full pool teardown + recreation
+  instead of in-place recycling) sidesteps that specific deadlock, but
+  measured live against the real library it made the memory *peak*
+  worse, not better — still an open problem. `--workers 1` is the only
+  currently memory-bounded option for very large libraries. 
 
 - **`--progress-interval`** (`03_match.py`, default `10.0` seconds,
   `--workers > 1` only): target seconds of work per chunk, so progress
@@ -353,9 +347,40 @@ calibrated values. Expect to spend real time here:
 
 **Recommended first real run:** `--limit 100` (or point `01_inventory.py`
 at a small subdirectory) through the whole pipeline, review results in the
-UI, adjust thresholds, repeat — before committing to fingerprinting all
-6000 files. Fingerprinting is the expensive stage; don't burn hours of
-compute on miscalibrated parameters.
+UI, adjust thresholds, repeat — before committing to fingerprinting 
+thousands of files. Fingerprinting is the expensive stage.
+
+### Benchmarks
+
+Real numbers from one specific machine (AMD Ryzen 7 7840HS w/ Radeon
+780M Graphics, 32GB RAM) — a useful reference point, not a guarantee for
+your hardware.
+
+- **Matching (`03_match.py`)**, real ~5000-video library, 11,728,306
+  candidate pairs after the duration prefilter, `--workers 15`:
+  - Pre-vectorization (nested Python loops): ~16.5 minutes.
+  - Post-vectorization (numpy `score_scenes`): ~7.5 minutes — roughly
+    2.2x faster, consistent across multiple runs.
+  - Memory (`docker stats`, whole container): climbs from ~2.7-2.9GB
+    shortly after starting to ~5.3-5.5GB at 50% progress to ~8GB near
+    completion, dropping to ~42MB the instant the run finishes — see
+    the `--workers` entry above for why this still isn't resolved.
+- **Fingerprinting (`02_fingerprint.py`) worker count**: 4 workers
+  tested faster than 6 or 8 on this hardware — more workers contending
+  for the same decode hardware/CPU cache stopped paying off well before
+  the core count. Real experienced results for info, but with mixed 
+  different videos - not a benchmark!:
+  1000 mixed videos - 8 workers - total time ~4h
+  2000 mixed videos - 6 workers - total time ~13h
+  1000 mixed videos - 8 workers - total time ~9h
+  1000 mixed videos - 4 workers - total time ~6h
+  Memory usage with 4 workers is around 1.8GB
+- **Fingerprinting CPU vs. GPU (`--hwaccel vaapi`) decode time**: not
+  yet benchmarked head-to-head. VAAPI decode has been validated for
+  *correctness* (right scene count, correct decode) on this hardware's
+  AMD iGPU, but no real before/after timing comparison has been run —
+  worth doing before assuming GPU decode is actually faster in practice
+  for this specific workload.
 
 ## Review UI
 
@@ -443,8 +468,7 @@ on rename, silently falling back to a slow copy-then-delete on every
 approval. `LIBRARY_PATHS` and `STAGE_DIR` should both point at
 subdirectories reached through that one library mount; the SQLite DB
 (under `/data`, see `DB_PATH`) doesn't need this treatment and can live
-anywhere persistent. See `CLAUDE.md` → "Deployment" for further
-reasoning.
+anywhere persistent.
 
 `<your /data mount>/remux_cache/` also lives there — lossless re-tagged
 copies of any source file whose MP4 codec tag is broken (see "Review
