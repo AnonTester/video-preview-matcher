@@ -1,5 +1,104 @@
 # Changelog
 
+## 2026-06-25 — 0.14.0
+
+- **Fix (real production incident, found via user report): staging a
+  file and then running any later scan made it unrecoverable through
+  the UI.** Approving a preview moves its file into the staging folder,
+  which lives outside every scanned library root — the very next
+  inventory run saw the original path gone and flagged it
+  `missing_since` exactly like a real deletion, which hid the staged
+  preview (and its undo button) from the review queue and exposed its
+  `decisions` row to `/api/missing-files/prune`'s cascading delete — the
+  *only* record of where to undo it back to. Reported live: a real
+  27-file staging batch vanished from the queue after a routine full
+  scan, with all 27 sitting in the missing-files list one confirm-click
+  away from permanent, unrecoverable data loss. Fixed in three
+  independent layers (see CLAUDE.md's Architecture for the full
+  writeup): `01_inventory.py`'s `reconcile_missing()` now never flags a
+  staged video missing and self-heals any row already wrongly flagged;
+  `04_serve.py`'s missing-files listing/pruning independently exclude
+  staged decisions too; and the review queue's staged previews are now
+  sourced directly from `decisions`, never through `matches` or
+  filtered by `missing_since` at all, closing a second, separate latent
+  path to the same symptom (a re-scored `03_match.py` run dropping the
+  pair's `matches` row below threshold).
+- **Added Pending/Staged tabs and pagination to the review queue** —
+  140+ rows on one page was unwieldy, and the fix above already needed
+  a `decisions`-driven query for staged previews, which doubles as
+  exactly what a dedicated Staged tab needs. `/` now takes
+  `?tab=pending|staged&page=N`, 40 rows per page, with pagination
+  controls above and below the list. "Back to queue" and the post-
+  decide/undo redirects now return to whichever tab/page the human
+  actually came from instead of always resetting to Pending page 1.
+
+## 2026-06-25 — 0.13.3
+
+- **Fix (real bug, found via user report immediately after 0.13.2
+  shipped): the staging-bar's bottom-right floating fix from 0.13.2 was
+  itself a usability regression** — it overlapped review-queue content,
+  was hard to read against whatever was scrolled underneath it, and sat
+  exactly where a misclick during review could land. Removed the
+  floating/`position: fixed` behavior entirely; `.staging-bar` is now a
+  second static bar directly below `.topbar`, full width, same as
+  mobile already did (mobile's version of this bar was never floating
+  to begin with, for the same underlying reason — no screen real estate
+  to spare on a corner widget that overlaps content). Desktop and mobile
+  now share the one `.staging-bar` rule; the mobile-only override block
+  that used to exist for this is gone, since there's nothing left for it
+  to do differently. Verified live with screenshots at both 1280px and
+  375px width.
+
+## 2026-06-25 — 0.13.2
+
+- **Fix (real bug, found via user report): a staged preview's video
+  player 404'd on the review page.** `/stream/{video_id}` always read
+  `videos.path`, which deliberately keeps pointing at a preview's
+  pre-staging location (display purposes only — see Architecture) — but
+  once approved, the actual file has been renamed into the staging
+  folder, so the original path no longer exists on disk. Added
+  `_staged_file_path()`, which resolves a staged preview's real on-disk
+  location (plain filename, or the `__{preview_id}` collision suffix —
+  see `/api/decide`), and wired `/stream/{video_id}` to check it whenever
+  the video has a `'staged'` decision. `/api/undo/{preview_id}` now
+  shares the same helper instead of duplicating the lookup inline.
+- **Fix (real bug, found by `_staged_file_path`'s own regression test
+  while writing the above): two staged previews sharing the same bare
+  filename could resolve to the wrong file.** The old undo logic (now
+  shared via `_staged_file_path`) checked the plain filename *before*
+  the `__{preview_id}` suffix — but the plain name only ever
+  unambiguously belongs to whichever preview claimed it *first*; if a
+  second, later-staged preview also has that filename, only it carries
+  the disambiguating suffix. Checking plain-name first could therefore
+  resolve the suffixed preview's lookup to its sibling's file instead.
+  Fixed by checking the `__{preview_id}`-suffixed name first, falling
+  back to the plain name only when no suffixed file exists for this
+  specific preview — the suffix, when present, is always unambiguous.
+- **Fix (real bug, found via user report): the staging-folder summary
+  ("staging: N files, M MB" + "empty staging folder") was invisible on
+  desktop at any file count, not just hidden-at-zero as intended** (a
+  prior fix had correctly added hide-at-zero, but the box was unusable
+  regardless of count). Root cause: `.staging-bar` is `position: fixed`
+  with no `z-index`, while `.topbar` is `position: sticky; z-index: 10`
+  — the staging-bar was genuinely rendered (confirmed via DOM dump: not
+  `display:none`, correct text) but painted entirely behind the
+  topbar's opaque background. Moving it from the top-right corner (which
+  the topbar's own right-aligned stats already occupy) to bottom-right
+  (the one corner nothing else in this app claims — `.action-bar`, the
+  only other fixed/sticky bar, only exists on review.html) fixes the
+  visibility bug without just trading it for a same-corner text overlap;
+  a defensive `z-index: 11` was kept too. Verified live with real
+  screenshots (1280px and 375px) against a throwaway test instance: the
+  box now renders correctly, unobstructed, at both widths, both for zero
+  and non-zero staged-file counts.
+- Clarified `CLAUDE.md`'s "Testing on homeserver" section: this repo's
+  working directory, when accessed by an agent, is a network mount of
+  the real homeserver checkout — `.venv/`, `data/`, etc. being visible
+  there does not mean they're executable from wherever the mount is
+  being read from. All Python execution (tests, the app itself) must go
+  through an actual `ssh homeserver` command; the live container's HTTP
+  API can be queried directly over the network without SSH.
+
 ## 2026-06-23 — 0.13.1
 
 - **Confirmed live against the real library: `--pool-generation-chunks`

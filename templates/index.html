@@ -94,41 +94,88 @@
 
   <div class="queue">
     <div class="queue-header">
-      <h1>Review queue — {{ matches|length }} previews with a candidate match</h1>
-      <span class="sub">sorted by confidence, undecided first</span>
+      <h1>
+        {% if tab == 'staged' %}
+          Staged for deletion — {{ total_count }} preview{{ "" if total_count == 1 else "s" }}
+        {% else %}
+          Review queue — {{ total_count }} preview{{ "" if total_count == 1 else "s" }} with a candidate match
+        {% endif %}
+      </h1>
+      <span class="sub">{{ "most recently staged first" if tab == 'staged' else "sorted by confidence, undecided first" }}</span>
     </div>
+
+    <div class="queue-tabs">
+      <a class="queue-tab {{ 'active' if tab == 'pending' }}" href="?tab=pending">
+        Pending <span class="count">{{ pending_count }}</span>
+      </a>
+      <a class="queue-tab {{ 'active' if tab == 'staged' }}" href="?tab=staged">
+        Staged <span class="count">{{ staged_count }}</span>
+      </a>
+    </div>
+
+    {% macro pagination_controls() %}
+      {% if total_pages > 1 %}
+      <div class="pagination">
+        <a class="page-link {{ 'disabled' if page <= 1 }}" href="?tab={{ tab }}&page={{ page - 1 }}">&laquo; prev</a>
+        <span class="page-info">page {{ page }} of {{ total_pages }}</span>
+        <a class="page-link {{ 'disabled' if page >= total_pages }}" href="?tab={{ tab }}&page={{ page + 1 }}">next &raquo;</a>
+      </div>
+      {% endif %}
+    {% endmacro %}
+
+    {{ pagination_controls() }}
 
     {% if matches|length == 0 %}
     <div class="empty-state">
       <div class="big">—</div>
-      <div>No matches yet.</div>
+      <div>{{ "No staged files." if tab == 'staged' else "No matches yet." }}</div>
     </div>
     {% endif %}
 
-    {% for m in matches %}
-    {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
-    <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}">
-      <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
-      <div class="filename">
-        <span class="label">preview</span>
-        {{ m.preview_filename }}
-      </div>
-      <div class="filename">
-        <span class="label">best match</span>
-        {{ m.candidate_filename }}
-      </div>
-      <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
-      <div>
-        {% if m.decision_status == 'staged' %}
+    {% if tab == 'staged' %}
+      {% for m in matches %}
+      <a class="row" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
+        <div class="score-badge">—</div>
+        <div class="filename">
+          <span class="label">preview</span>
+          {{ m.preview_filename }}
+        </div>
+        <div class="filename">
+          <span class="label">best match</span>
+          {{ m.candidate_filename or "—" }}
+        </div>
+        <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
+        <div>
           <div class="status-pill staged">staged</div>
-        {% elif m.decision_status == 'rejected' %}
-          <div class="status-pill rejected">rejected</div>
-        {% else %}
-          <div class="status-pill">pending</div>
-        {% endif %}
-      </div>
-    </a>
-    {% endfor %}
+        </div>
+      </a>
+      {% endfor %}
+    {% else %}
+      {% for m in matches %}
+      {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
+      <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
+        <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
+        <div class="filename">
+          <span class="label">preview</span>
+          {{ m.preview_filename }}
+        </div>
+        <div class="filename">
+          <span class="label">best match</span>
+          {{ m.candidate_filename }}
+        </div>
+        <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
+        <div>
+          {% if m.decision_status == 'rejected' %}
+            <div class="status-pill rejected">rejected</div>
+          {% else %}
+            <div class="status-pill">pending</div>
+          {% endif %}
+        </div>
+      </a>
+      {% endfor %}
+    {% endif %}
+
+    {{ pagination_controls() }}
   </div>
 
   <script>

@@ -114,6 +114,66 @@ a { color: inherit; }
   color: var(--text-dim);
 }
 
+.queue-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.queue-tab {
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--text-dim);
+  text-decoration: none;
+  padding: 8px 4px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+}
+
+.queue-tab:hover { color: var(--text); }
+
+.queue-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.queue-tab .count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.queue-tab.active .count { color: var(--text-dim); }
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 10px 0;
+  font-family: var(--sans);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.pagination .page-link {
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 12px;
+}
+
+.pagination .page-link:hover { background: var(--bg-hover); }
+
+.pagination .page-link.disabled {
+  color: var(--text-faint);
+  pointer-events: none;
+  border-color: var(--border);
+  opacity: 0.5;
+}
+
 .row {
   display: grid;
   grid-template-columns: 56px 1fr 1fr 90px 100px;
@@ -721,15 +781,27 @@ a { color: inherit; }
 /* staging drawer */
 
 .staging-bar {
-  position: fixed;
-  top: 14px;
-  right: 24px;
+  /* A second static bar right after .topbar, full width — not floating.
+     This used to be `position: fixed` (first top-right, overlapping
+     .topbar's own sticky z-index:10 layer and invisible at any file
+     count; then bottom-right, which fixed visibility but sat over
+     review-queue content, hard to read and an easy misclick mid-review).
+     Mobile already used this exact non-floating layout (narrow screens
+     can't spare the horizontal space for a floating corner widget) —
+     same reasoning applies at any width, so it's just the one rule now. */
+  position: static;
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 11.5px;
   color: var(--text-dim);
-  display: flex;
-  gap: 10px;
-  align-items: center;
 }
 
 .staging-bar a, .staging-bar button {
@@ -775,19 +847,6 @@ kbd {
     flex-wrap: wrap;
     gap: 10px 16px;
     font-size: 11px;
-  }
-
-  /* Fixed positioning eats scarce horizontal space on narrow screens —
-     drop back into normal flow, right after the topbar (its position in
-     the HTML already), full width. */
-  .staging-bar {
-    position: static;
-    width: 100%;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    padding: 8px 14px;
-    background: var(--bg-raised);
-    border-bottom: 1px solid var(--border);
   }
 
   .queue, .review-shell {

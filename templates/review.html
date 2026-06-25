@@ -9,7 +9,7 @@
 <body>
 
   <div class="topbar">
-    <a class="back-link" href="/">&larr; back to queue</a>
+    <a class="back-link" href="/?tab={{ back_tab }}&page={{ back_page }}">&larr; back to queue</a>
     <div class="brand">video #{{ preview.id }}</div>
   </div>
 
@@ -139,6 +139,7 @@
     const PREVIEW_ID = {{ preview.id }};
     const PREVIEW_SCENE_COUNT = {{ preview_scene_count }};
     const CANDIDATES = {{ candidates|tojson }};
+    const BACK_URL = '/?tab={{ back_tab }}&page={{ back_page }}';
     let currentIdx = 0;
 
     function fmtTime(s) {
@@ -255,7 +256,7 @@
         alert('Error: ' + (err.detail || res.statusText));
         return;
       }
-      window.location.href = '/';
+      window.location.href = BACK_URL;
     }
 
     async function undoDecision() {
@@ -293,7 +294,7 @@
 
       CANDIDATES.splice(currentIdx, 1);
       if (CANDIDATES.length === 0) {
-        window.location.href = '/';
+        window.location.href = BACK_URL;
         return;
       }
       currentIdx = Math.min(currentIdx, CANDIDATES.length - 1);

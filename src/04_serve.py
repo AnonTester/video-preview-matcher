@@ -70,6 +70,7 @@ SCAN ORCHESTRATION (no manual commands required):
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -159,45 +160,116 @@ def get_video_row(conn, video_id: int):
 # Page routes
 # ---------------------------------------------------------------------------
 
-def queue_rows(conn) -> list[dict]:
-    """One row per preview, with its best match among non-missing
-    candidates, ordered worst-decided-first (highest confidence and not
-    yet decided floats to the top). A preview whose candidates are *all*
-    missing matches nothing here and is correctly absent from the
-    queue — a preview with a missing *top* candidate but a viable
+PAGE_SIZE = 40
+
+# Shared between queue_rows() and _pending_total() so the two can never
+# drift apart (the count must describe exactly the same set the rows are
+# a page of). AND (d.status IS NULL OR d.status != 'staged') is what
+# keeps a staged preview out of the pending tab once it has one — the
+# staged tab (staged_queue_rows() below) is where it lives instead.
+_PENDING_FROM_WHERE = """
+    FROM matches m
+    JOIN videos p ON p.id = m.preview_id
+    JOIN videos c ON c.id = m.candidate_id
+    LEFT JOIN decisions d ON d.preview_id = m.preview_id
+    WHERE p.missing_since IS NULL AND c.missing_since IS NULL
+    AND (d.status IS NULL OR d.status != 'staged')
+    AND m.id IN (
+        SELECT m2.id FROM matches m2
+        JOIN videos c2 ON c2.id = m2.candidate_id
+        WHERE m2.preview_id = m.preview_id AND c2.missing_since IS NULL
+        ORDER BY m2.combined_score DESC LIMIT 1
+    )
+"""
+
+
+def _pending_total(conn) -> int:
+    return conn.execute(f"SELECT COUNT(*) AS n {_PENDING_FROM_WHERE}").fetchone()["n"]
+
+
+def _staged_total(conn) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM decisions WHERE status = 'staged'").fetchone()["n"]
+
+
+def queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
+    """One row per *pending* preview (not yet staged — see
+    staged_queue_rows() for that bucket), with its best match among
+    non-missing candidates, ordered worst-decided-first (highest
+    confidence and not yet decided floats to the top; a rejected
+    preview, having no file consequence either way, just sinks toward
+    the bottom rather than getting its own tab). A preview whose
+    candidates are *all* missing matches nothing here and is correctly
+    absent — a preview with a missing *top* candidate but a viable
     second-best one still surfaces with that one, rather than
     disappearing from the queue just because its #1 match happened to be
     the file that vanished (see db.py's missing_since docstring — nothing
     is ever deleted by this, it's just hidden until a human prunes via
-    /api/missing-files/prune or the file reappears on a later scan)."""
+    /api/missing-files/prune or the file reappears on a later scan).
+    Returns (rows_for_this_page, total_matching_count) for pagination."""
+    page = max(1, page)
+    total = _pending_total(conn)
     rows = conn.execute(
-        """
+        f"""
         SELECT
             m.preview_id, p.filename AS preview_filename, p.duration_sec AS preview_duration,
             m.candidate_id, c.filename AS candidate_filename, c.duration_sec AS candidate_duration,
             m.visual_score, m.audio_score, m.combined_score,
             d.status AS decision_status
-        FROM matches m
-        JOIN videos p ON p.id = m.preview_id
-        JOIN videos c ON c.id = m.candidate_id
-        LEFT JOIN decisions d ON d.preview_id = m.preview_id
-        WHERE p.missing_since IS NULL AND c.missing_since IS NULL
-        AND m.id IN (
-            SELECT m2.id FROM matches m2
-            JOIN videos c2 ON c2.id = m2.candidate_id
-            WHERE m2.preview_id = m.preview_id AND c2.missing_since IS NULL
-            ORDER BY m2.combined_score DESC LIMIT 1
-        )
+        {_PENDING_FROM_WHERE}
         ORDER BY (d.status IS NOT NULL) ASC, m.combined_score DESC
-        """
+        LIMIT ? OFFSET ?
+        """,
+        (page_size, (page - 1) * page_size),
     ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in rows], total
+
+
+def staged_queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
+    """Staged previews — read directly from `decisions`, deliberately
+    *not* through `matches` the way queue_rows() does. Found necessary
+    via a real incident: a preview that's been approved-for-deletion and
+    re-scored by a later 03_match.py run can drop below threshold and
+    lose its `matches` row entirely (matches is fully recomputed every
+    run — see Architecture in CLAUDE.md), and 01_inventory.py naturally
+    flags its now-staged-away original path missing on the next scan.
+    Either one alone used to make an already-staged preview vanish from
+    every view in the UI, with its `decisions` row — the only record of
+    where to undo it back to — becoming unreachable through any link.
+    Sourcing straight from `decisions` instead means a staged preview
+    stays visible and undoable regardless of what matching or inventory
+    do later; missing_since is intentionally not checked anywhere here.
+    Returns (rows_for_this_page, total_staged_count)."""
+    page = max(1, page)
+    total = _staged_total(conn)
+    rows = conn.execute(
+        """
+        SELECT d.preview_id, p.filename AS preview_filename, p.duration_sec AS preview_duration,
+               d.matched_candidate_id AS candidate_id, c.filename AS candidate_filename,
+               c.duration_sec AS candidate_duration, d.decided_at
+        FROM decisions d
+        JOIN videos p ON p.id = d.preview_id
+        LEFT JOIN videos c ON c.id = d.matched_candidate_id
+        WHERE d.status = 'staged'
+        ORDER BY d.decided_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (page_size, (page - 1) * page_size),
+    ).fetchall()
+    return [dict(r) for r in rows], total
 
 
 @app.get("/")
-def index(request: Request):
+def index(request: Request, tab: str = "pending", page: int = 1):
+    tab = tab if tab in ("pending", "staged") else "pending"
+    page = max(1, page)
+
     with connect(STATE["db_path"]) as conn:
-        matches = queue_rows(conn)
+        if tab == "staged":
+            matches, total = staged_queue_rows(conn, page)
+            pending_count, staged_count = _pending_total(conn), total
+        else:
+            matches, total = queue_rows(conn, page)
+            pending_count, staged_count = total, _staged_total(conn)
 
         stats = conn.execute(
             """
@@ -211,15 +283,23 @@ def index(request: Request):
             """
         ).fetchone()
 
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+
     return templates.TemplateResponse(request, "index.html", {
         "matches": matches,
         "stats": dict(stats),
         "app_version": APP_VERSION,
+        "tab": tab,
+        "page": page,
+        "total_pages": total_pages,
+        "total_count": total,
+        "pending_count": pending_count,
+        "staged_count": staged_count,
     })
 
 
 @app.get("/review/{preview_id}")
-def review_detail(request: Request, preview_id: int):
+def review_detail(request: Request, preview_id: int, tab: str = "pending", page: int = 1):
     with connect(STATE["db_path"]) as conn:
         preview = get_video_row(conn, preview_id)
         candidates = conn.execute(
@@ -249,6 +329,8 @@ def review_detail(request: Request, preview_id: int):
         "candidates": candidates_parsed,
         "decision": dict(decision) if decision else None,
         "preview_scene_count": preview_scene_count,
+        "back_tab": tab if tab in ("pending", "staged") else "pending",
+        "back_page": page,
     })
 
 
@@ -305,6 +387,34 @@ def _has_broken_codec_tag(path: Path) -> bool:
     return result
 
 
+def _staged_file_path(original_path: Path, preview_id: int) -> Path | None:
+    """Resolves a staged preview's actual on-disk location under the
+    staging folder — same filename, or the `__{preview_id}` collision
+    suffix (see /api/decide's approved_delete branch) — or None if
+    neither is present. `videos.path` keeps pointing at the pre-staging
+    location (display purposes only; see Architecture in CLAUDE.md), so
+    anything that needs to actually open the file post-staging (stream,
+    undo) must resolve through here instead of trusting that column.
+
+    Checks the `__{preview_id}`-suffixed name *first*, plain name second
+    — not an arbitrary choice. If two staged previews ever share a bare
+    filename, only the one that lost the collision at staging time ever
+    gets a suffixed file; checking that first means a preview which *did*
+    collide is never misresolved to its plain-named sibling's file just
+    because that sibling also happens to still be sitting in the staging
+    folder (a real bug, caught by this function's own regression test:
+    checking plain-name first picked the wrong preview's file whenever
+    both were staged at once, e.g. resolving #20 to #10's content)."""
+    stage_dir = Path(STATE["stage_dir"])
+    candidate = stage_dir / f"{original_path.stem}__{preview_id}{original_path.suffix}"
+    if candidate.is_file():
+        return candidate
+    candidate = stage_dir / original_path.name
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 def _ensure_playable(path: Path, video_id: int) -> Path:
     """Returns a path safe to stream to a browser: the original file, or a
     cached re-tagged remux of it if the original has a broken codec tag
@@ -339,7 +449,18 @@ def _ensure_playable(path: Path, video_id: int) -> Path:
 def stream_video(video_id: int, request: Request):
     with connect(STATE["db_path"]) as conn:
         row = get_video_row(conn, video_id)
+        decision = conn.execute(
+            "SELECT status FROM decisions WHERE preview_id = ?", (video_id,)
+        ).fetchone()
     path = Path(row["path"])
+    if decision is not None and decision["status"] == "staged":
+        # The file was renamed into the staging folder on approval — the
+        # `videos.path` row deliberately still shows the original location
+        # (see Architecture in CLAUDE.md), so it has to be resolved here,
+        # not trusted directly, or playback 404s on every staged preview.
+        staged_path = _staged_file_path(path, video_id)
+        if staged_path is not None:
+            path = staged_path
     if not path.is_file():
         raise HTTPException(404, f"file missing on disk: {path}")
 
@@ -473,13 +594,9 @@ def undo(preview_id: int):
             raise HTTPException(404, "no decision recorded for this preview")
 
         if decision["status"] == "staged":
-            stage_dir = Path(STATE["stage_dir"])
             original_path = Path(preview["path"])
-            staged_path = stage_dir / original_path.name
-            if not staged_path.is_file():
-                # might have been renamed due to collision
-                staged_path = stage_dir / f"{original_path.stem}__{preview_id}{original_path.suffix}"
-            if staged_path.is_file():
+            staged_path = _staged_file_path(original_path, preview_id)
+            if staged_path is not None:
                 original_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(staged_path), str(original_path))
 
@@ -523,40 +640,67 @@ async def purge_staging(request: Request):
     return JSONResponse({"ok": True, "deleted": deleted})
 
 
-@app.get("/api/missing-files")
-def missing_files():
+def list_missing_files(conn) -> list[dict]:
     """Videos rows flagged missing by 01_inventory.py (path not found
     under a scanned library root on the last inventory run — see
     db.py's missing_since docstring). Listed, never auto-deleted; a
-    human reviews this list and explicitly prunes via
-    /api/missing-files/prune, same two-step pattern as the staging
-    folder above."""
+    human reviews this list and explicitly prunes via prune_missing_
+    files(), same two-step pattern as the staging folder above.
+
+    Excludes anything with a 'staged' decision even if it's flagged
+    missing — 01_inventory.py's reconcile_missing() shouldn't ever set
+    that combination anymore (see its docstring for the incident this
+    caused), but this is the second, independent layer: a staged
+    preview's `decisions` row is the only record of where to undo it
+    back to, so it must never be listed here, let alone pruned, no
+    matter how missing_since ended up set."""
+    rows = conn.execute(
+        """SELECT v.id, v.path, v.filename, v.missing_since FROM videos v
+           LEFT JOIN decisions d ON d.preview_id = v.id
+           WHERE v.missing_since IS NOT NULL AND (d.status IS NULL OR d.status != 'staged')
+           ORDER BY v.missing_since ASC"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def prune_missing_files(conn) -> int:
+    """Permanently deletes the `videos` rows currently flagged missing
+    (cascading to their scenes/audio_fp/matches/decisions/match_feedback
+    via the existing ON DELETE CASCADE foreign keys — see db.py). This
+    never touches any file on disk — these rows already have no file
+    backing them (that's what "missing" means); pruning only removes
+    the now-meaningless DB history for them.
+
+    Never deletes a video with a 'staged' decision — see
+    list_missing_files()'s docstring; same reasoning, same exclusion,
+    independently enforced here too, since this is the destructive half.
+    Returns the number of rows deleted."""
+    cur = conn.execute(
+        """DELETE FROM videos WHERE missing_since IS NOT NULL
+           AND id NOT IN (SELECT preview_id FROM decisions WHERE status = 'staged')"""
+    )
+    return cur.rowcount
+
+
+@app.get("/api/missing-files")
+def missing_files():
     with connect(STATE["db_path"]) as conn:
-        rows = conn.execute(
-            "SELECT id, path, filename, missing_since FROM videos "
-            "WHERE missing_since IS NOT NULL ORDER BY missing_since ASC"
-        ).fetchall()
-    return {"files": [dict(r) for r in rows]}
+        return {"files": list_missing_files(conn)}
 
 
 @app.post("/api/missing-files/prune")
-async def prune_missing_files(request: Request):
+async def prune_missing_files_route(request: Request):
     """
-    Permanently deletes the `videos` rows currently flagged missing
-    (cascading to their scenes/audio_fp/matches/decisions/match_feedback
-    via the existing ON DELETE CASCADE foreign keys — see db.py).
     Requires {"confirm": "DELETE"}, same deliberate-friction pattern as
-    /api/purge-staging. This never touches any file on disk — these rows
-    already have no file backing them (that's what "missing" means);
-    pruning only removes the now-meaningless DB history for them.
+    /api/purge-staging. See prune_missing_files() for what this deletes
+    (and what it deliberately never deletes).
     """
     body = await request.json()
     if body.get("confirm") != "DELETE":
         raise HTTPException(400, "must confirm with {'confirm': 'DELETE'}")
 
     with connect(STATE["db_path"]) as conn:
-        cur = conn.execute("DELETE FROM videos WHERE missing_since IS NOT NULL")
-        deleted = cur.rowcount
+        deleted = prune_missing_files(conn)
 
     return JSONResponse({"ok": True, "deleted": deleted})
 

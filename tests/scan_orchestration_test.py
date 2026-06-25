@@ -114,15 +114,23 @@ def _seed_match(conn, preview_id, candidate_id, combined_score):
     )
 
 
+def _seed_decision(conn, preview_id, status, matched_candidate_id=None, decided_at=0.0):
+    conn.execute(
+        "INSERT INTO decisions (preview_id, status, matched_candidate_id, decided_at) VALUES (?, ?, ?, ?)",
+        (preview_id, status, matched_candidate_id, decided_at),
+    )
+
+
 def test_queue_rows_includes_normal_match():
     reset()
     with connect(TMP_DB) as conn:
         _seed_video(conn, 1)
         _seed_video(conn, 2)
         _seed_match(conn, 1, 2, 0.9)
-        rows = serve_mod.queue_rows(conn)
+        rows, total = serve_mod.queue_rows(conn)
     assert [r["preview_id"] for r in rows] == [1]
     assert rows[0]["candidate_id"] == 2
+    assert total == 1
     print("test_queue_rows_includes_normal_match: OK")
 
 
@@ -132,8 +140,9 @@ def test_queue_rows_excludes_missing_preview():
         _seed_video(conn, 1, missing_since=123.0)
         _seed_video(conn, 2)
         _seed_match(conn, 1, 2, 0.9)
-        rows = serve_mod.queue_rows(conn)
+        rows, total = serve_mod.queue_rows(conn)
     assert rows == [], rows
+    assert total == 0
     print("test_queue_rows_excludes_missing_preview: OK")
 
 
@@ -148,9 +157,10 @@ def test_queue_rows_falls_back_to_second_best_when_top_candidate_missing():
         _seed_video(conn, 3)                         # lower score, present
         _seed_match(conn, 1, 2, 0.95)
         _seed_match(conn, 1, 3, 0.50)
-        rows = serve_mod.queue_rows(conn)
+        rows, total = serve_mod.queue_rows(conn)
     assert len(rows) == 1, rows
     assert rows[0]["candidate_id"] == 3, rows[0]
+    assert total == 1
     print("test_queue_rows_falls_back_to_second_best_when_top_candidate_missing: OK")
 
 
@@ -162,9 +172,114 @@ def test_queue_rows_excludes_preview_when_all_candidates_missing():
         _seed_video(conn, 3, missing_since=456.0)
         _seed_match(conn, 1, 2, 0.95)
         _seed_match(conn, 1, 3, 0.50)
-        rows = serve_mod.queue_rows(conn)
+        rows, total = serve_mod.queue_rows(conn)
     assert rows == [], rows
+    assert total == 0
     print("test_queue_rows_excludes_preview_when_all_candidates_missing: OK")
+
+
+def test_queue_rows_excludes_staged_preview():
+    """A staged preview belongs in staged_queue_rows()'s bucket, not
+    here — this is the pending-tab/staged-tab split."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        _seed_decision(conn, 1, "staged")
+        rows, total = serve_mod.queue_rows(conn)
+    assert rows == [], rows
+    assert total == 0
+    print("test_queue_rows_excludes_staged_preview: OK")
+
+
+def test_queue_rows_includes_rejected_preview():
+    """Unlike 'staged', 'rejected' previews stay in the pending tab
+    (sunk to the bottom via decision_status, not split into their own
+    tab) — only confirmed deletions get a dedicated tab."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        _seed_decision(conn, 1, "rejected")
+        rows, total = serve_mod.queue_rows(conn)
+    assert [r["preview_id"] for r in rows] == [1]
+    assert rows[0]["decision_status"] == "rejected"
+    assert total == 1
+    print("test_queue_rows_includes_rejected_preview: OK")
+
+
+def test_queue_rows_paginates():
+    reset()
+    with connect(TMP_DB) as conn:
+        for i in range(1, 6):
+            _seed_video(conn, i * 2 - 1)
+            _seed_video(conn, i * 2)
+            _seed_match(conn, i * 2 - 1, i * 2, 1.0 - i * 0.01)  # descending scores
+        page1, total = serve_mod.queue_rows(conn, page=1, page_size=2)
+        page2, total2 = serve_mod.queue_rows(conn, page=2, page_size=2)
+    assert total == 5 and total2 == 5
+    assert [r["preview_id"] for r in page1] == [1, 3]
+    assert [r["preview_id"] for r in page2] == [5, 7]
+    print("test_queue_rows_paginates: OK")
+
+
+def test_staged_queue_rows_includes_staged_preview_independent_of_matches():
+    """The actual incident this exists for: a staged preview must stay
+    visible even when it has no `matches` row at all (e.g. dropped by a
+    later 03_match.py re-score) — staged_queue_rows() reads straight from
+    `decisions`, never joining through `matches`."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        # Deliberately no _seed_match() call — no matches row exists.
+        _seed_decision(conn, 1, "staged", matched_candidate_id=2, decided_at=5.0)
+        rows, total = serve_mod.staged_queue_rows(conn)
+    assert total == 1
+    assert rows[0]["preview_id"] == 1
+    assert rows[0]["candidate_id"] == 2
+    assert rows[0]["candidate_filename"] == "2.mp4"
+    print("test_staged_queue_rows_includes_staged_preview_independent_of_matches: OK")
+
+
+def test_staged_queue_rows_includes_staged_preview_even_when_missing():
+    """Independently of the matches-table fix: staged_queue_rows() must
+    not filter on missing_since either, so a preview wrongly (or
+    legitimately, post-purge) flagged missing while still staged stays
+    reachable for undo."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=999.0)
+        _seed_decision(conn, 1, "staged")
+        rows, total = serve_mod.staged_queue_rows(conn)
+    assert total == 1
+    assert rows[0]["preview_id"] == 1
+    print("test_staged_queue_rows_includes_staged_preview_even_when_missing: OK")
+
+
+def test_staged_queue_rows_excludes_non_staged_decisions():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_decision(conn, 1, "rejected")
+        rows, total = serve_mod.staged_queue_rows(conn)
+    assert rows == [] and total == 0
+    print("test_staged_queue_rows_excludes_non_staged_decisions: OK")
+
+
+def test_staged_queue_rows_orders_most_recently_staged_first():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_decision(conn, 1, "staged", decided_at=1.0)
+        _seed_decision(conn, 2, "staged", decided_at=2.0)
+        rows, total = serve_mod.staged_queue_rows(conn)
+    assert total == 2
+    assert [r["preview_id"] for r in rows] == [2, 1]
+    print("test_staged_queue_rows_orders_most_recently_staged_first: OK")
 
 
 def test_build_cmd_inventory_includes_roots_and_limit():
@@ -492,6 +607,63 @@ def test_all_descendant_pids_finds_grandchildren():
     print("test_all_descendant_pids_finds_grandchildren: OK")
 
 
+def test_list_missing_files_excludes_staged():
+    """The destructive incident this guards against: a staged preview
+    must never show up in the missing-files list, no matter how
+    missing_since ended up set on it — this list is exactly what feeds
+    the prune confirmation dialog."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=100.0)
+        _seed_video(conn, 2, missing_since=200.0)
+        _seed_decision(conn, 1, "staged")
+        files = serve_mod.list_missing_files(conn)
+    assert [f["id"] for f in files] == [2], files
+    print("test_list_missing_files_excludes_staged: OK")
+
+
+def test_list_missing_files_includes_rejected_and_undecided():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=100.0)
+        _seed_video(conn, 2, missing_since=200.0)
+        _seed_decision(conn, 1, "rejected")
+        files = serve_mod.list_missing_files(conn)
+    assert {f["id"] for f in files} == {1, 2}, files
+    print("test_list_missing_files_includes_rejected_and_undecided: OK")
+
+
+def test_prune_missing_files_never_deletes_a_staged_video():
+    """The actual data-loss incident: pruning must skip a staged video
+    even though it's flagged missing, since its `decisions` row
+    (cascade-deleted otherwise) is the only record of where to undo it
+    back to."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=100.0)
+        _seed_decision(conn, 1, "staged")
+        deleted = serve_mod.prune_missing_files(conn)
+        remaining = conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()["n"]
+        decisions_remaining = conn.execute("SELECT COUNT(*) AS n FROM decisions").fetchone()["n"]
+    assert deleted == 0, deleted
+    assert remaining == 1, remaining
+    assert decisions_remaining == 1, decisions_remaining
+    print("test_prune_missing_files_never_deletes_a_staged_video: OK")
+
+
+def test_prune_missing_files_deletes_genuinely_missing_videos():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1, missing_since=100.0)
+        _seed_video(conn, 2, missing_since=200.0)
+        _seed_decision(conn, 1, "staged")
+        deleted = serve_mod.prune_missing_files(conn)
+        remaining_ids = {r["id"] for r in conn.execute("SELECT id FROM videos").fetchall()}
+    assert deleted == 1, deleted
+    assert remaining_ids == {1}, remaining_ids
+    print("test_prune_missing_files_deletes_genuinely_missing_videos: OK")
+
+
 if __name__ == "__main__":
     test_update_scan_run_writes_fields()
     test_update_scan_run_noop_without_run_id()
@@ -501,6 +673,17 @@ if __name__ == "__main__":
     test_queue_rows_excludes_missing_preview()
     test_queue_rows_falls_back_to_second_best_when_top_candidate_missing()
     test_queue_rows_excludes_preview_when_all_candidates_missing()
+    test_queue_rows_excludes_staged_preview()
+    test_queue_rows_includes_rejected_preview()
+    test_queue_rows_paginates()
+    test_staged_queue_rows_includes_staged_preview_independent_of_matches()
+    test_staged_queue_rows_includes_staged_preview_even_when_missing()
+    test_staged_queue_rows_excludes_non_staged_decisions()
+    test_staged_queue_rows_orders_most_recently_staged_first()
+    test_list_missing_files_excludes_staged()
+    test_list_missing_files_includes_rejected_and_undecided()
+    test_prune_missing_files_never_deletes_a_staged_video()
+    test_prune_missing_files_deletes_genuinely_missing_videos()
     test_build_cmd_inventory_includes_roots_and_limit()
     test_build_cmd_includes_debug_log_for_inventory_and_fingerprint()
     test_build_cmd_inventory_omits_limit_when_not_set()

@@ -200,6 +200,80 @@ def test_reconcile_missing_leaves_present_unflagged_files_alone():
     print("test_reconcile_missing_leaves_present_unflagged_files_alone: OK")
 
 
+def test_reconcile_missing_never_flags_a_staged_preview():
+    """The actual incident this guards against: approving a preview
+    moves its file into the (unscanned) staging folder, so its original
+    path genuinely won't be in present_paths. Without this exclusion,
+    the next inventory run flags it missing, which hides it from the
+    queue and exposes its decision row to /api/missing-files/prune —
+    losing the only record of where to undo it back to."""
+    reset()
+    db_path = TMP / "test.db"
+    inventory_mod.init_db(db_path)
+    p = TMP / "root_a" / "staged.mp4"
+
+    with inventory_mod.connect(db_path) as conn:
+        vid = _insert_video(conn, p)
+        conn.execute(
+            "INSERT INTO decisions (preview_id, status, decided_at) VALUES (?, 'staged', ?)",
+            (vid, 12345.0),
+        )
+        # The file is gone from present_paths, exactly as if it had been
+        # moved to the staging folder and this run never saw it.
+        n_missing, n_recovered = inventory_mod.reconcile_missing(conn, [TMP / "root_a"], present_paths=set())
+        row = conn.execute("SELECT missing_since FROM videos WHERE path = ?", (str(p),)).fetchone()
+
+    assert n_missing == 0, n_missing
+    assert row["missing_since"] is None, "a staged preview must never be flagged missing"
+    print("test_reconcile_missing_never_flags_a_staged_preview: OK")
+
+
+def test_reconcile_missing_self_heals_an_already_mis_flagged_staged_preview():
+    """Covers upgrading from a version without the above exclusion: a
+    row that's already (wrongly) flagged missing from a past run must
+    get healed the moment a staged decision is found for it, without
+    needing a manual DB repair."""
+    reset()
+    db_path = TMP / "test.db"
+    inventory_mod.init_db(db_path)
+    p = TMP / "root_a" / "already_flagged.mp4"
+
+    with inventory_mod.connect(db_path) as conn:
+        vid = _insert_video(conn, p, missing_since=99999.0)
+        conn.execute(
+            "INSERT INTO decisions (preview_id, status, decided_at) VALUES (?, 'staged', ?)",
+            (vid, 12345.0),
+        )
+        n_missing, n_recovered = inventory_mod.reconcile_missing(conn, [TMP / "root_a"], present_paths=set())
+        row = conn.execute("SELECT missing_since FROM videos WHERE path = ?", (str(p),)).fetchone()
+
+    assert n_recovered == 1, n_recovered
+    assert row["missing_since"] is None
+    print("test_reconcile_missing_self_heals_an_already_mis_flagged_staged_preview: OK")
+
+
+def test_reconcile_missing_still_flags_a_rejected_preview():
+    """A 'rejected' decision never moves a file, so a rejected preview
+    going missing is still real signal — only 'staged' is exempt."""
+    reset()
+    db_path = TMP / "test.db"
+    inventory_mod.init_db(db_path)
+    p = TMP / "root_a" / "rejected.mp4"
+
+    with inventory_mod.connect(db_path) as conn:
+        vid = _insert_video(conn, p)
+        conn.execute(
+            "INSERT INTO decisions (preview_id, status, decided_at) VALUES (?, 'rejected', ?)",
+            (vid, 12345.0),
+        )
+        n_missing, n_recovered = inventory_mod.reconcile_missing(conn, [TMP / "root_a"], present_paths=set())
+        row = conn.execute("SELECT missing_since FROM videos WHERE path = ?", (str(p),)).fetchone()
+
+    assert n_missing == 1, n_missing
+    assert row["missing_since"] is not None
+    print("test_reconcile_missing_still_flags_a_rejected_preview: OK")
+
+
 def test_find_move_candidate_matches_unique_missing_row():
     reset()
     db_path = TMP / "test.db"
@@ -269,6 +343,9 @@ if __name__ == "__main__":
     test_reconcile_missing_ignores_paths_outside_scanned_roots()
     test_reconcile_missing_clears_flag_on_reappearance()
     test_reconcile_missing_leaves_present_unflagged_files_alone()
+    test_reconcile_missing_never_flags_a_staged_preview()
+    test_reconcile_missing_self_heals_an_already_mis_flagged_staged_preview()
+    test_reconcile_missing_still_flags_a_rejected_preview()
     test_find_move_candidate_matches_unique_missing_row()
     test_find_move_candidate_returns_none_when_no_match()
     test_find_move_candidate_returns_none_when_ambiguous()

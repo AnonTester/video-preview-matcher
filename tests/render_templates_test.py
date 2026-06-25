@@ -1,13 +1,22 @@
 """
 Render templates against real DB data using raw Jinja2, to validate
-template logic without needing FastAPI/uvicorn installed (not available
-in this sandbox — no network egress to pip install them). This exercises
+template logic without needing a real running server. This exercises
 the exact same data shapes the route handlers in 04_serve.py build, just
 without the HTTP layer around them. Run from project root:
 
     python3 tests/render_templates_test.py
+
+build_index_context() used to hand-duplicate 04_serve.py's pending-queue
+SQL inline (written back when FastAPI wasn't installable in the original
+dev sandbox) — it had already drifted out of sync with the real query
+(missing the missing_since filtering entirely) by the time tabs/
+pagination were added. Now loads 04_serve.py directly via importlib
+(same pattern as scan_orchestration_test.py) and calls its real
+queue_rows()/staged_queue_rows()/_pending_total()/_staged_total(),
+so this can't drift from production behavior again.
 """
 
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -21,28 +30,20 @@ PROJECT_ROOT = Path(__file__).parent.parent
 env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(PROJECT_ROOT / "templates")))
 env.filters["tojson"] = lambda v: json.dumps(v)
 
+spec = importlib.util.spec_from_file_location("serve_mod", PROJECT_ROOT / "src" / "04_serve.py")
+serve_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(serve_mod)
 
-def build_index_context(db_path):
+
+def build_index_context(db_path, tab="pending", page=1):
     with connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                m.preview_id, p.filename AS preview_filename, p.duration_sec AS preview_duration,
-                m.candidate_id, c.filename AS candidate_filename, c.duration_sec AS candidate_duration,
-                m.visual_score, m.audio_score, m.combined_score,
-                d.status AS decision_status
-            FROM matches m
-            JOIN videos p ON p.id = m.preview_id
-            JOIN videos c ON c.id = m.candidate_id
-            LEFT JOIN decisions d ON d.preview_id = m.preview_id
-            WHERE m.id IN (
-                SELECT id FROM matches m2
-                WHERE m2.preview_id = m.preview_id
-                ORDER BY m2.combined_score DESC LIMIT 1
-            )
-            ORDER BY (d.status IS NOT NULL) ASC, m.combined_score DESC
-            """
-        ).fetchall()
+        if tab == "staged":
+            rows, total = serve_mod.staged_queue_rows(conn, page)
+            pending_count, staged_count = serve_mod._pending_total(conn), total
+        else:
+            rows, total = serve_mod.queue_rows(conn, page)
+            pending_count, staged_count = total, serve_mod._staged_total(conn)
+
         stats = conn.execute(
             """
             SELECT
@@ -54,7 +55,14 @@ def build_index_context(db_path):
                 (SELECT COUNT(*) FROM decisions WHERE status = 'rejected') AS rejected
             """
         ).fetchone()
-    return {"matches": [dict(r) for r in rows], "stats": dict(stats), "app_version": "test", "request": None}
+
+    import math
+    total_pages = max(1, math.ceil(total / serve_mod.PAGE_SIZE))
+    return {
+        "matches": rows, "stats": dict(stats), "app_version": "test", "request": None,
+        "tab": tab, "page": page, "total_pages": total_pages, "total_count": total,
+        "pending_count": pending_count, "staged_count": staged_count,
+    }
 
 
 def build_review_context(db_path, preview_id):
@@ -87,13 +95,15 @@ def build_review_context(db_path, preview_id):
         "decision": dict(decision) if decision else None,
         "preview_scene_count": preview_scene_count,
         "request": None,
+        "back_tab": "pending",
+        "back_page": 1,
     }
 
 
 def main():
     db_path = PROJECT_ROOT / "data" / "library.db"
 
-    print("Rendering index.html ...")
+    print("Rendering index.html (pending tab) ...")
     ctx = build_index_context(db_path)
     tpl = env.get_template("index.html")
     out = tpl.render(**ctx)
@@ -101,6 +111,13 @@ def main():
     assert str(len(ctx["matches"])) in out or "0 previews" in out
     Path("/tmp/rendered_index.html").write_text(out)
     print(f"  OK — {len(out)} chars, {len(ctx['matches'])} match rows. Saved to /tmp/rendered_index.html")
+
+    print("Rendering index.html (staged tab) ...")
+    sctx = build_index_context(db_path, tab="staged")
+    sout = tpl.render(**sctx)
+    assert "Preview Matcher" in sout
+    assert "Staged for deletion" in sout
+    print(f"  OK — {len(sout)} chars, {len(sctx['matches'])} staged rows.")
 
     if ctx["matches"]:
         preview_id = ctx["matches"][0]["preview_id"]

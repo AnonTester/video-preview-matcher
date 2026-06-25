@@ -47,6 +47,26 @@ MISSING-FILE DETECTION (deleted, or moved somewhere not yet re-discovered):
     explicitly prunes them via `/api/missing-files/prune` (confirm-gated,
     same pattern as `/api/purge-staging`), or they reappear on their own.
 
+    **A preview with a `'staged'` decision is never flagged missing —
+    found via a real production incident.** Approving a preview moves
+    its file into the staging folder (a different, unscanned directory
+    — see Deployment in CLAUDE.md), so its original path genuinely
+    won't be in this run's walk. Without this exclusion, the very next
+    inventory run flags it missing anyway: `04_serve.py`'s queue hides
+    missing previews, so the preview vanished from the review UI with
+    no obvious way back, and `/api/missing-files/prune` (cascading via
+    `ON DELETE CASCADE`) would have deleted the `decisions` row that's
+    the *only* record of where to undo it back to — staging a file and
+    then re-scanning would have made it unrecoverable through the UI,
+    exactly the kind of irreversible mistake this whole tool exists to
+    prevent. `reconcile_missing()` now excludes any video with a
+    `'staged'` decision from ever being newly flagged, and proactively
+    clears the flag on any that already carry it (self-healing already-
+    affected rows the moment `01` next runs, no manual DB repair
+    needed). Scoped to `'staged'` specifically, not "has any decision":
+    `'rejected'` never moves a file, so a rejected preview going missing
+    is still a real, useful signal.
+
     **Scoped to the roots actually passed this run** — this is the part
     that matters for correctness, not just a nice-to-have: the web UI
     lets a human select a subset of `LIBRARY_PATHS` for a partial scan
@@ -203,13 +223,25 @@ def reconcile_missing(conn, roots: list[Path], present_paths: set[str]) -> tuple
     `roots` — see module docstring's MISSING-FILE DETECTION section for
     why scoping matters (a partial scan must never flag files under an
     unscanned root as missing). Returns (newly_missing, recovered)
-    counts."""
+    counts.
+
+    Videos with a `'staged'` decision are excluded from `newly_missing_ids`
+    and folded into `recovered_ids` regardless of whether their path is
+    actually in `present_paths` — see module docstring for why (their
+    absence is fully explained by staging, not a real disappearance, and
+    flagging them missing exposes their only undo record to
+    /api/missing-files/prune). This also self-heals any row already
+    mis-flagged by a previous run, before this exclusion existed."""
     root_strs = [str(r) for r in roots]
+    staged_ids = {
+        r["preview_id"] for r in conn.execute("SELECT preview_id FROM decisions WHERE status = 'staged'").fetchall()
+    }
 
     not_missing = conn.execute("SELECT id, path FROM videos WHERE missing_since IS NULL").fetchall()
     newly_missing_ids = [
         r["id"] for r in not_missing
-        if r["path"] not in present_paths and _path_under_any_root(r["path"], root_strs)
+        if r["id"] not in staged_ids
+        and r["path"] not in present_paths and _path_under_any_root(r["path"], root_strs)
     ]
     if newly_missing_ids:
         now = time.time()
@@ -219,7 +251,7 @@ def reconcile_missing(conn, roots: list[Path], present_paths: set[str]) -> tuple
         )
 
     currently_missing = conn.execute("SELECT id, path FROM videos WHERE missing_since IS NOT NULL").fetchall()
-    recovered_ids = [r["id"] for r in currently_missing if r["path"] in present_paths]
+    recovered_ids = [r["id"] for r in currently_missing if r["path"] in present_paths or r["id"] in staged_ids]
     if recovered_ids:
         conn.executemany(
             "UPDATE videos SET missing_since = NULL WHERE id = ?",

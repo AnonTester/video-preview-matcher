@@ -4,11 +4,23 @@ handlers in isolation, without needing FastAPI loaded. Verifies:
   - approving a match renames (not copies) the file into the stage dir
   - filename collisions in the stage dir are handled
   - undo restores the file to its original location
+
+Also exercises 04_serve.py's real _staged_file_path() (loaded directly,
+same importlib pattern as the other digit-prefixed-module tests) — the
+helper /stream/{video_id} now uses to find a staged preview's file under
+the staging folder, since `videos.path` keeps pointing at the original,
+pre-staging location.
 """
 
+import importlib.util
 import shutil
 import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location("serve_mod", PROJECT_ROOT / "src" / "04_serve.py")
+serve_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(serve_mod)
 
 TMP = Path("/tmp/stage_test")
 
@@ -97,9 +109,60 @@ def test_undo_when_nothing_staged_is_noop():
     print("test_undo_when_nothing_staged_is_noop: OK")
 
 
+def test_staged_file_path_resolves_for_streaming():
+    reset()
+    lib = TMP / "library"
+    stage = TMP / "_to_delete"
+    serve_mod.STATE["stage_dir"] = str(stage)
+
+    src = lib / "preview_a.mp4"
+    src.write_text("fake video bytes")
+    dest = simulate_approve(src, stage, preview_id=1)
+
+    resolved = serve_mod._staged_file_path(src, preview_id=1)
+    assert resolved == dest, "should resolve to the staged copy, not the (now-gone) original path"
+    print("test_staged_file_path_resolves_for_streaming: OK")
+
+
+def test_staged_file_path_resolves_collision_suffix():
+    reset()
+    lib = TMP / "library"
+    stage = TMP / "_to_delete"
+    serve_mod.STATE["stage_dir"] = str(stage)
+
+    (lib / "sub1").mkdir()
+    (lib / "sub2").mkdir()
+    src1 = lib / "sub1" / "preview.mp4"
+    src2 = lib / "sub2" / "preview.mp4"
+    src1.write_text("video one")
+    src2.write_text("video two")
+    simulate_approve(src1, stage, preview_id=10)
+    dest2 = simulate_approve(src2, stage, preview_id=20)
+
+    resolved = serve_mod._staged_file_path(src2, preview_id=20)
+    assert resolved == dest2, "should resolve the collision-suffixed staged copy"
+    print("test_staged_file_path_resolves_collision_suffix: OK")
+
+
+def test_staged_file_path_returns_none_when_nothing_staged():
+    reset()
+    lib = TMP / "library"
+    stage = TMP / "_to_delete"
+    serve_mod.STATE["stage_dir"] = str(stage)
+
+    src = lib / "never_staged.mp4"
+    src.write_text("untouched")
+
+    assert serve_mod._staged_file_path(src, preview_id=5) is None
+    print("test_staged_file_path_returns_none_when_nothing_staged: OK")
+
+
 if __name__ == "__main__":
     test_basic_stage_and_undo()
     test_collision_handling()
     test_undo_when_nothing_staged_is_noop()
+    test_staged_file_path_resolves_for_streaming()
+    test_staged_file_path_resolves_collision_suffix()
+    test_staged_file_path_returns_none_when_nothing_staged()
     shutil.rmtree(TMP)
     print("\nAll staging logic tests passed.")

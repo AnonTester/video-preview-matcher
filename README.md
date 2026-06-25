@@ -121,7 +121,11 @@ row just gets hidden from the active review queue (its matches won't
 show up, but nothing about them is touched) until it either reappears on
 its own or a human explicitly removes it via the queue page's "missing
 files" panel / `POST /api/missing-files/prune` (same explicit-confirm
-pattern as emptying the staging folder).
+pattern as emptying the staging folder). **A preview you've already
+staged for deletion is never flagged missing or pruned this way** — its
+file is expected to be gone from the library (it's in the staging
+folder, not deleted), and that's tracked separately; see the Staged tab
+below.
 
 ## Triggering scans from the web UI
 
@@ -356,7 +360,7 @@ Real numbers from one specific machine (AMD Ryzen 7 7840HS w/ Radeon
 780M Graphics, 32GB RAM) — a useful reference point, not a guarantee for
 your hardware.
 
-- **Matching (`03_match.py`)**, real ~5000-video library, 11,728,306
+- **Matching (`03_match.py`)**, real 5000-video library, 11,728,306
   candidate pairs after the duration prefilter, `--workers 15`:
   - Pre-vectorization (nested Python loops): ~16.5 minutes.
   - Post-vectorization (numpy `score_scenes`): ~7.5 minutes — roughly
@@ -365,15 +369,17 @@ your hardware.
     shortly after starting to ~5.3-5.5GB at 50% progress to ~8GB near
     completion, dropping to ~42MB the instant the run finishes — see
     the `--workers` entry above for why this still isn't resolved.
+  - ~6000-video library, 16,673,930 candidate pairs, 8 workers, total time ~12 minutes, memory usage gradually climbing to 11.2GB
+  - amount of CPU workers does not appear to significantly impact the memory usage during matching
 - **Fingerprinting (`02_fingerprint.py`) worker count**: 4 workers
   tested faster than 6 or 8 on this hardware — more workers contending
   for the same decode hardware/CPU cache stopped paying off well before
   the core count. Real experienced results for info, but with mixed 
   different videos - not a benchmark!:
-  1000 mixed videos - 8 workers - total time ~4h
-  2000 mixed videos - 6 workers - total time ~13h
-  1000 mixed videos - 8 workers - total time ~9h
-  1000 mixed videos - 4 workers - total time ~6h
+  - 1000 mixed videos - 8 workers - total time ~4h
+  - 2000 mixed videos - 6 workers - total time ~13h
+  - 1000 mixed videos - 8 workers - total time ~9h
+  - 1000 mixed videos - 4 workers - total time ~6h
   Memory usage with 4 workers is around 1.8GB
 - **Fingerprinting CPU vs. GPU (`--hwaccel vaapi`) decode time**: not
   yet benchmarked head-to-head. VAAPI decode has been validated for
@@ -389,13 +395,20 @@ video comparison all reflow for a phone-width screen) — useful for
 checking on a long-running scan, or doing a quick approve/reject pass,
 from a phone without it just rendering a zoomed-out desktop page.
 
-- Queue (`/`) lists every preview with at least one candidate match above
-  the noise floor, sorted by confidence (undecided + highest-confidence
-  first). A preview or candidate flagged missing (see "Keeping the
-  database in sync with the library" above) is hidden here — a "missing
-  files" panel next to the staging-folder controls lists them and lets
-  you prune the DB rows explicitly (confirm-gated; never touches a file,
-  since these rows have none left to touch).
+- Queue (`/`) has two tabs: **Pending** lists every undecided-or-rejected
+  preview with at least one candidate match above the noise floor,
+  sorted by confidence (undecided + highest-confidence first); **Staged**
+  lists every preview currently staged for deletion, most recently staged
+  first — kept separate so you can review/undo what's about to be
+  deleted without scrolling past everything else, and (unlike Pending)
+  never affected by a later re-scan or re-match changing what it's
+  shown next to. Each tab is paginated, 40 rows per page. A preview or
+  candidate flagged missing (see "Keeping the database in sync with the
+  library" above) is hidden from Pending — a "missing files" panel next
+  to the staging-folder controls lists them and lets you prune the DB
+  rows explicitly (confirm-gated; never touches a file, since these rows
+  have none left to touch; a staged preview is never included here, see
+  above).
 - Detail page (`/review/{id}`) shows the preview and best-match candidate
   side-by-side (full file path shown for both), with buttons to jump each
   player to a matched scene timestamp. Switch between candidates (if a
@@ -424,7 +437,7 @@ from a phone without it just rendering a zoomed-out desktop page.
   deleted automatically.** This tool only identifies candidates and waits
   — leaving a preview undecided is always fine, there's no time pressure
   or auto-action. Approval moves the file into the staging folder (a
-  rename — instant, no extra disk space). The top-right "empty staging
+  rename — instant, no extra disk space). The bottom-right "empty staging
   folder" button is the only irreversible action in the tool, and
   requires an explicit confirm.
 - Undo is available on any decided preview from its review page.
