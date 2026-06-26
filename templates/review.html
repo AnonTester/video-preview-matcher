@@ -83,9 +83,12 @@
       <div class="video-panel">
         <div class="panel-head">
           <span class="tag">preview (candidate for deletion)</span>
-          <span class="fname">{{ preview.filename }}</span>
+          <span class="meta">{{ preview_meta }}</span>
         </div>
-        <div class="panel-path">{{ preview.path }}</div>
+        <div class="panel-path">
+          <div class="panel-folder">{{ preview_folder }}</div>
+          <div class="panel-filename">{{ preview.filename }}</div>
+        </div>
         <video id="preview-video" controls src="/stream/{{ preview.id }}"></video>
         <div class="playback-warning" id="preview-playback-warning" style="display:none;"></div>
         <div class="scene-jumps" id="preview-jumps"></div>
@@ -94,9 +97,12 @@
       <div class="video-panel">
         <div class="panel-head">
           <span class="tag">matched full version</span>
-          <span class="fname" id="candidate-fname">{{ candidates[0].candidate_filename }}</span>
+          <span class="meta" id="candidate-meta">{{ candidates[0].candidate_meta }}</span>
         </div>
-        <div class="panel-path" id="candidate-path">{{ candidates[0].candidate_path }}</div>
+        <div class="panel-path">
+          <div class="panel-folder" id="candidate-folder">{{ candidates[0].candidate_folder }}</div>
+          <div class="panel-filename" id="candidate-filename">{{ candidates[0].candidate_filename }}</div>
+        </div>
         <div class="missing-banner" id="candidate-missing-banner" style="{{ '' if candidates[0].candidate_missing_since else 'display:none;' }}">
           This candidate file was not found on disk during the last library scan.
         </div>
@@ -145,6 +151,36 @@
     function fmtTime(s) {
       const m = Math.floor(s / 60), sec = Math.floor(s % 60);
       return `${m}:${sec.toString().padStart(2,'0')}`;
+    }
+
+    // Whole-video duration (handles hours, unlike fmtTime above which is
+    // for in-video seek timestamps) — same convention as index.html's
+    // fmtDuration, mirrored server-side in 04_serve.py's _fmt_duration
+    // for the initial Jinja-rendered panel.
+    function fmtDuration(sec) {
+      if (sec == null) return '—';
+      sec = Math.max(0, Math.round(sec));
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    // Mirrors 04_serve.py's _fmt_size.
+    function fmtSize(bytes) {
+      if (bytes == null) return '—';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let size = bytes;
+      for (const unit of units) {
+        if (size < 1024) return unit === 'B' || unit === 'KB' ? `${Math.round(size)} ${unit}` : `${size.toFixed(1)} ${unit}`;
+        size /= 1024;
+      }
+      return `${size.toFixed(1)} TB`;
+    }
+
+    function fmtVideoMeta(durationSec, width, height, sizeBytes) {
+      const resolution = (width && height) ? `${width}x${height}` : '—';
+      return `${fmtDuration(durationSec)} · ${resolution} · ${fmtSize(sizeBytes)}`;
     }
 
     function fmtDur(s) {
@@ -242,8 +278,10 @@
       const c = CANDIDATES[idx];
       document.getElementById('candidate-playback-warning').style.display = 'none';
       document.getElementById('candidate-video').src = `/stream/${c.candidate_id}`;
-      document.getElementById('candidate-fname').textContent = c.candidate_filename;
-      document.getElementById('candidate-path').textContent = c.candidate_path;
+      document.getElementById('candidate-meta').textContent =
+        fmtVideoMeta(c.candidate_duration, c.candidate_width, c.candidate_height, c.candidate_size_bytes);
+      document.getElementById('candidate-folder').textContent = c.candidate_folder;
+      document.getElementById('candidate-filename').textContent = c.candidate_filename;
       document.getElementById('candidate-missing-banner').style.display = c.candidate_missing_since ? '' : 'none';
       document.getElementById('visual-score').textContent = Math.round(c.visual_score * 100) + '%';
       document.getElementById('audio-score').textContent = c.audio_score !== null ? Math.round(c.audio_score * 100) + '%' : '—';

@@ -633,19 +633,30 @@ def test_list_missing_files_includes_rejected_and_undecided():
     print("test_list_missing_files_includes_rejected_and_undecided: OK")
 
 
+REMUX_TEST_DIR = Path("/tmp/scan_orch_test_remux_cache")
+
+
+def _reset_remux_dir():
+    import shutil
+    if REMUX_TEST_DIR.exists():
+        shutil.rmtree(REMUX_TEST_DIR)
+    REMUX_TEST_DIR.mkdir(parents=True)
+
+
 def test_prune_missing_files_never_deletes_a_staged_video():
     """The actual data-loss incident: pruning must skip a staged video
     even though it's flagged missing, since its `decisions` row
     (cascade-deleted otherwise) is the only record of where to undo it
     back to."""
     reset()
+    _reset_remux_dir()
     with connect(TMP_DB) as conn:
         _seed_video(conn, 1, missing_since=100.0)
         _seed_decision(conn, 1, "staged")
-        deleted = serve_mod.prune_missing_files(conn)
+        pruned_ids = serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
         remaining = conn.execute("SELECT COUNT(*) AS n FROM videos").fetchone()["n"]
         decisions_remaining = conn.execute("SELECT COUNT(*) AS n FROM decisions").fetchone()["n"]
-    assert deleted == 0, deleted
+    assert pruned_ids == [], pruned_ids
     assert remaining == 1, remaining
     assert decisions_remaining == 1, decisions_remaining
     print("test_prune_missing_files_never_deletes_a_staged_video: OK")
@@ -653,15 +664,110 @@ def test_prune_missing_files_never_deletes_a_staged_video():
 
 def test_prune_missing_files_deletes_genuinely_missing_videos():
     reset()
+    _reset_remux_dir()
     with connect(TMP_DB) as conn:
         _seed_video(conn, 1, missing_since=100.0)
         _seed_video(conn, 2, missing_since=200.0)
         _seed_decision(conn, 1, "staged")
-        deleted = serve_mod.prune_missing_files(conn)
+        pruned_ids = serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
         remaining_ids = {r["id"] for r in conn.execute("SELECT id FROM videos").fetchall()}
-    assert deleted == 1, deleted
+    assert pruned_ids == [2], pruned_ids
     assert remaining_ids == {1}, remaining_ids
     print("test_prune_missing_files_deletes_genuinely_missing_videos: OK")
+
+
+def test_prune_missing_files_returns_empty_list_when_nothing_to_prune():
+    reset()
+    _reset_remux_dir()
+    with connect(TMP_DB) as conn:
+        pruned_ids = serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
+    assert pruned_ids == [], pruned_ids
+    print("test_prune_missing_files_returns_empty_list_when_nothing_to_prune: OK")
+
+
+def test_prune_missing_files_deletes_orphaned_remux_cache_entry():
+    """The actual gap this guards against: a missing video that was
+    ever played through the remux fallback leaves a permanent orphaned
+    remux_cache/{id}.mp4 behind once its row is pruned, unless pruning
+    itself cleans it up — nothing else ever revisits remux_cache/."""
+    reset()
+    _reset_remux_dir()
+    (REMUX_TEST_DIR / "2.mp4").write_text("cached remux content")
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 2, missing_since=200.0)
+        serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
+    assert not (REMUX_TEST_DIR / "2.mp4").exists()
+    print("test_prune_missing_files_deletes_orphaned_remux_cache_entry: OK")
+
+
+def test_prune_missing_files_leaves_other_remux_cache_entries_alone():
+    reset()
+    _reset_remux_dir()
+    (REMUX_TEST_DIR / "1.mp4").write_text("still a live video, never pruned")
+    (REMUX_TEST_DIR / "2.mp4").write_text("genuinely missing, gets pruned")
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)  # not missing
+        _seed_video(conn, 2, missing_since=200.0)
+        serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
+    assert (REMUX_TEST_DIR / "1.mp4").exists()
+    assert not (REMUX_TEST_DIR / "2.mp4").exists()
+    print("test_prune_missing_files_leaves_other_remux_cache_entries_alone: OK")
+
+
+STAGE_TEST_DIR = Path("/tmp/scan_orch_test_stage_dir")
+
+
+def _reset_stage_dir():
+    import shutil
+    if STAGE_TEST_DIR.exists():
+        shutil.rmtree(STAGE_TEST_DIR)
+    STAGE_TEST_DIR.mkdir(parents=True)
+
+
+def test_purge_staging_files_deletes_staged_files_and_flips_decisions():
+    reset()
+    _reset_stage_dir()
+    _reset_remux_dir()
+    (STAGE_TEST_DIR / "preview_a.mp4").write_text("staged content")
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_decision(conn, 1, "staged")
+        deleted = serve_mod.purge_staging_files(conn, STAGE_TEST_DIR, REMUX_TEST_DIR)
+        status = conn.execute("SELECT status FROM decisions WHERE preview_id = 1").fetchone()["status"]
+    assert deleted == 1, deleted
+    assert not (STAGE_TEST_DIR / "preview_a.mp4").exists()
+    assert status == "deleted"
+    print("test_purge_staging_files_deletes_staged_files_and_flips_decisions: OK")
+
+
+def test_purge_staging_files_deletes_orphaned_remux_cache_entries_for_staged_videos():
+    """The actual gap this guards against: a staged video that was ever
+    played through the remux fallback leaves a permanent orphaned
+    remux_cache/{id}.mp4 behind once it's purged, unless purging itself
+    cleans it up."""
+    reset()
+    _reset_stage_dir()
+    _reset_remux_dir()
+    (STAGE_TEST_DIR / "preview_a.mp4").write_text("staged content")
+    (REMUX_TEST_DIR / "1.mp4").write_text("cached remux of the staged video")
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_decision(conn, 1, "staged")
+        serve_mod.purge_staging_files(conn, STAGE_TEST_DIR, REMUX_TEST_DIR)
+    assert not (REMUX_TEST_DIR / "1.mp4").exists()
+    print("test_purge_staging_files_deletes_orphaned_remux_cache_entries_for_staged_videos: OK")
+
+
+def test_purge_staging_files_leaves_other_remux_cache_entries_alone():
+    reset()
+    _reset_stage_dir()
+    _reset_remux_dir()
+    (REMUX_TEST_DIR / "5.mp4").write_text("unrelated, never staged, must survive")
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 5)  # never staged
+        serve_mod.purge_staging_files(conn, STAGE_TEST_DIR, REMUX_TEST_DIR)
+    assert (REMUX_TEST_DIR / "5.mp4").exists()
+    print("test_purge_staging_files_leaves_other_remux_cache_entries_alone: OK")
 
 
 if __name__ == "__main__":
@@ -684,6 +790,12 @@ if __name__ == "__main__":
     test_list_missing_files_includes_rejected_and_undecided()
     test_prune_missing_files_never_deletes_a_staged_video()
     test_prune_missing_files_deletes_genuinely_missing_videos()
+    test_prune_missing_files_returns_empty_list_when_nothing_to_prune()
+    test_prune_missing_files_deletes_orphaned_remux_cache_entry()
+    test_prune_missing_files_leaves_other_remux_cache_entries_alone()
+    test_purge_staging_files_deletes_staged_files_and_flips_decisions()
+    test_purge_staging_files_deletes_orphaned_remux_cache_entries_for_staged_videos()
+    test_purge_staging_files_leaves_other_remux_cache_entries_alone()
     test_build_cmd_inventory_includes_roots_and_limit()
     test_build_cmd_includes_debug_log_for_inventory_and_fingerprint()
     test_build_cmd_inventory_omits_limit_when_not_set()

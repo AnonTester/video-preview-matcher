@@ -23,15 +23,45 @@ STREAMING:
     individual files are multiple GB.
 
     Some real files in this library (likely from scraped/re-muxed
-    sources) have a valid h264/aac bitstream but a missing/zero codec
-    FourCC tag in their MP4 sample description. ffmpeg/VLC shrug this
-    off (they fall back to extradata), but a browser's native demuxer
-    rejects them outright ("no supported source was found"), even though
-    the codec itself is fine. /stream/{video_id} detects this
-    (_has_broken_codec_tag) and transparently serves a cached, re-tagged
-    `-c copy` remux instead (_ensure_playable) — lossless, no re-encode,
-    built once per affected file under data/remux_cache/ and reused after
-    that. The original file is never modified.
+    sources) are unplayable in a browser for one of two independent
+    reasons, both detected by _probe_playability() and fixed the same
+    way by _ensure_playable() — a cached, re-tagged `-c copy` remux,
+    lossless, no re-encode, built once per affected file under
+    data/remux_cache/ and reused after that. The original file is never
+    modified:
+
+    1. A valid h264/aac bitstream but a missing/zero codec FourCC tag in
+       its MP4 sample description. ffmpeg/VLC shrug this off (they fall
+       back to extradata), but a browser's native demuxer rejects it
+       outright ("no supported source was found"), even though the
+       codec itself is fine.
+    2. The file's *actual* container, per ffprobe's format_name, isn't
+       one a browser's native <video> demuxer understands at all —
+       found via video #5855: a file named *.mp4 that's actually raw
+       MPEG-TS. Its codec_tag is a real, non-zero MPEG-TS stream_type
+       (0x1b for H.264), not the broken-MP4-tag pattern at all, so
+       check #1 alone never caught it; the browser still rejects it
+       with the same "no supported source" error, since it can't parse
+       an MPEG-TS container from a plain <video src> regardless of the
+       codec inside being fine.
+
+    matroska/webm are deliberately exempt from *both* checks: ffprobe
+    always reports codec_tag=0x0000 for every Matroska-family file (it
+    has no FourCC-tag concept at all) — that's normal, not a defect,
+    and confirmed live against the real library's actual .mkv/.webm
+    files. Treating check #1 as container-agnostic would have flagged
+    *every* mkv/webm file in the library as "broken" the first time it
+    was ever streamed.
+
+    The remux itself only ever runs when the source is actually h264
+    video with aac-or-no audio (true for every real case found in this
+    library so far) — _ensure_playable() checks this before remuxing,
+    not just before deciding whether to. Forcing the hardcoded
+    avc1/mp4a tags onto a different codec (the library does have a
+    handful of av1/hevc/vp9 videos) would mislabel it, not fix it —
+    actively breaking playback instead of restoring it. When that
+    safety check fails, the original file is served as a last resort,
+    same as a failed ffmpeg remux attempt.
 
 NOT-A-MATCH FEEDBACK:
     Distinct from the preview-level approve/reject decision, a single
@@ -154,6 +184,44 @@ def get_video_row(conn, video_id: int):
     if row is None:
         raise HTTPException(404, f"video {video_id} not found")
     return dict(row)
+
+
+def _fmt_size(num_bytes) -> str:
+    """Human-readable filesize, e.g. '1.2 GB', '340 MB'. Mirrored in
+    review.html's JS (fmtSize) for the candidate panel, which re-renders
+    without a page reload when switching between match candidates."""
+    if num_bytes is None:
+        return "—"
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _fmt_duration(seconds) -> str:
+    """'1h 15m' / '3m 20s' / '45s' — same convention as index.html's
+    fmtDuration (JS) for the queue list, reused here for consistency.
+    Mirrored in review.html's JS (fmtDuration) for the candidate panel."""
+    if seconds is None:
+        return "—"
+    seconds = max(0, round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _fmt_video_meta(duration_sec, width, height, size_bytes) -> str:
+    """'1h 15m · 1920x1080 · 1.2 GB' for a video panel's card title —
+    replaces the filename there (now shown on its own line below,
+    split from its folder; see review.html)."""
+    resolution = f"{width}x{height}" if width and height else "—"
+    return f"{_fmt_duration(duration_sec)} · {resolution} · {_fmt_size(size_bytes)}"
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +375,7 @@ def review_detail(request: Request, preview_id: int, tab: str = "pending", page:
             SELECT m.*, c.filename AS candidate_filename, c.path AS candidate_path,
                    c.duration_sec AS candidate_duration,
                    c.width AS candidate_width, c.height AS candidate_height,
+                   c.size_bytes AS candidate_size_bytes,
                    c.missing_since AS candidate_missing_since
             FROM matches m JOIN videos c ON c.id = m.candidate_id
             WHERE m.preview_id = ?
@@ -322,10 +391,15 @@ def review_detail(request: Request, preview_id: int, tab: str = "pending", page:
     for c in candidates:
         d = dict(c)
         d["scene_matches"] = json.loads(d["scene_matches_json"]) if d["scene_matches_json"] else []
+        d["candidate_meta"] = _fmt_video_meta(d["candidate_duration"], d["candidate_width"], d["candidate_height"],
+                                               d["candidate_size_bytes"])
+        d["candidate_folder"] = os.path.dirname(d["candidate_path"])
         candidates_parsed.append(d)
 
     return templates.TemplateResponse(request, "review.html", {
         "preview": preview,
+        "preview_meta": _fmt_video_meta(preview["duration_sec"], preview["width"], preview["height"], preview["size_bytes"]),
+        "preview_folder": os.path.dirname(preview["path"]),
         "candidates": candidates_parsed,
         "decision": dict(decision) if decision else None,
         "preview_scene_count": preview_scene_count,
@@ -359,32 +433,92 @@ def _debug_log_path() -> Path:
 # those requests forever (found via the debug log above: the same already-
 # confirmed-clean file logged dozens of identical checks within seconds of
 # normal playback). Keyed by mtime so a replaced file is re-checked.
-_CODEC_TAG_CACHE: dict[str, tuple[float, bool]] = {}
+_PLAYABILITY_CACHE: dict[str, tuple[float, dict]] = {}
+
+# format_name families ffprobe reports for containers a browser's native
+# <video> demuxer already understands directly — no remux needed even if
+# codec_tag looks "broken" (see _probe_playability's docstring for why
+# that's expected, not a defect, for the matroska family specifically).
+_BROWSER_NATIVE_FORMATS = ("mp4", "matroska", "webm")
 
 
-def _has_broken_codec_tag(path: Path) -> bool:
-    """True if the file's video stream has a missing/zero codec FourCC tag
-    in its MP4 sample description. Confirmed against real files in this
-    library: ffmpeg/VLC tolerate this (they fall back to the avcC/esds
-    extradata to figure out the real codec), but browsers' native
-    demuxers reject it outright with "no supported source was found" —
-    even though the underlying codec (h264/aac here) is otherwise
-    perfectly browser-playable. A `-c copy` remux that re-tags the streams
-    (avc1/mp4a) fixes playback losslessly, with no re-encode."""
+def _parse_playability(ffprobe_json: dict) -> dict:
+    """Pure decision logic over an already-parsed ffprobe JSON response
+    (requested via `-show_entries stream=codec_name,codec_tag,codec_type:
+    format=format_name`) — separated from _probe_playability's actual
+    subprocess call specifically so this part is unit-testable without
+    invoking real ffprobe. Returns {"needs_remux": bool, "video_codec":
+    str|None, "audio_codec": str|None}. needs_remux is True for either
+    of two independent reasons — see module docstring's STREAMING
+    section for the full incident writeup behind each:
+
+    1. A real MP4-family file with a missing/zero codec FourCC tag
+       (codec_tag) in its sample description.
+    2. The file's *actual* container (format_name) isn't one a browser
+       understands at all, regardless of extension or codec_tag — e.g.
+       a *.mp4 file that's actually raw MPEG-TS (video #5855).
+
+    matroska/webm are exempt from check #1: ffprobe reports
+    codec_tag=0x0000 for every Matroska-family file unconditionally (no
+    FourCC-tag concept in that container), so applying check #1
+    container-agnostically would flag every single real .mkv/.webm file
+    as "broken" — confirmed against this library's actual mkv/webm
+    files, none of which need or want a remux.
+
+    video_codec/audio_codec are returned so the caller can verify it's
+    actually safe to force the avc1/mp4a tags before remuxing — see
+    _safe_to_remux/_ensure_playable."""
+    result = {"needs_remux": False, "video_codec": None, "audio_codec": None}
+    streams = ffprobe_json.get("streams", [])
+    fmt_name = ffprobe_json.get("format", {}).get("format_name", "") or ""
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video is None:
+        return result
+
+    result["video_codec"] = video.get("codec_name")
+    result["audio_codec"] = audio.get("codec_name") if audio else None
+    is_mp4_family = "mp4" in fmt_name
+    is_browser_native = any(fam in fmt_name for fam in _BROWSER_NATIVE_FORMATS)
+    video_tag = str(video.get("codec_tag") or "").strip()
+    broken_mp4_tag = is_mp4_family and video_tag in ("0x0000", "0x0", "0", "")
+    result["needs_remux"] = broken_mp4_tag or not is_browser_native
+    return result
+
+
+def _safe_to_remux(info: dict) -> bool:
+    """True only when forcing the hardcoded avc1/mp4a tags during remux
+    would be correct, not a mislabeling — h264 video with aac-or-no
+    audio. This library does have a handful of av1/hevc/vp9 videos;
+    tagging one of those as avc1 would break playback, not fix it. See
+    _ensure_playable's docstring."""
+    return info["video_codec"] == "h264" and info["audio_codec"] in (None, "aac")
+
+
+def _probe_playability(path: Path) -> dict:
+    """One ffprobe call, cached by mtime — see _parse_playability for
+    the actual decision logic over its output."""
     key = str(path)
     mtime = path.stat().st_mtime
-    cached = _CODEC_TAG_CACHE.get(key)
+    cached = _PLAYABILITY_CACHE.get(key)
     if cached is not None and cached[0] == mtime:
         return cached[1]
 
     out = run_with_hard_timeout(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_tag", "-of", "csv=p=0", str(path)],
+        ["ffprobe", "-v", "error",
+         "-show_entries", "stream=codec_name,codec_tag,codec_type:format=format_name",
+         "-of", "json", str(path)],
         timeout=REMUX_PROBE_TIMEOUT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        log_path=_debug_log_path(), log_label=f"ffprobe(codec-tag): {path.name}",
+        log_path=_debug_log_path(), log_label=f"ffprobe(playability): {path.name}",
     )
-    result = out is not None and out.returncode == 0 and out.stdout.strip() in ("0x0000", "0", "")
-    _CODEC_TAG_CACHE[key] = (mtime, result)
+    result = {"needs_remux": False, "video_codec": None, "audio_codec": None}
+    if out is not None and out.returncode == 0:
+        try:
+            result = _parse_playability(json.loads(out.stdout))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass  # can't tell; conservative default (no remux) above
+
+    _PLAYABILITY_CACHE[key] = (mtime, result)
     return result
 
 
@@ -418,15 +552,23 @@ def _staged_file_path(original_path: Path, preview_id: int) -> Path | None:
 
 def _ensure_playable(path: Path, video_id: int) -> Path:
     """Returns a path safe to stream to a browser: the original file, or a
-    cached re-tagged remux of it if the original has a broken codec tag
-    (see _has_broken_codec_tag). Never modifies the original — the remux
-    is a separate file under remux_cache/, built once per affected file
-    and reused after that."""
+    cached re-tagged remux of it if the original needs one (see
+    _probe_playability). Never modifies the original — the remux is a
+    separate file under remux_cache/, built once per affected file and
+    reused after that.
+
+    Only actually remuxes when the source is h264 video with aac-or-no
+    audio — forcing the hardcoded avc1/mp4a tags onto any other codec
+    (this library does have a handful of av1/hevc/vp9 videos) would
+    mislabel it, not fix it, breaking playback instead of restoring it.
+    Falls back to serving the original untouched when that safety check
+    fails, same as a failed ffmpeg remux attempt below."""
     cache_path = _remux_cache_dir() / f"{video_id}.mp4"
     if cache_path.is_file() and cache_path.stat().st_mtime >= path.stat().st_mtime:
         return cache_path
 
-    if not _has_broken_codec_tag(path):
+    info = _probe_playability(path)
+    if not info["needs_remux"] or not _safe_to_remux(info):
         return path
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -616,18 +758,18 @@ def staging_summary():
     return {"file_count": len(files), "total_bytes": total, "path": str(stage_dir)}
 
 
-@app.post("/api/purge-staging")
-async def purge_staging(request: Request):
-    """
-    Permanently deletes everything in the staging folder. Requires
-    {"confirm": "DELETE"} in the body as a deliberate friction point —
-    this is the one truly irreversible action in the whole tool.
-    """
-    body = await request.json()
-    if body.get("confirm") != "DELETE":
-        raise HTTPException(400, "must confirm with {'confirm': 'DELETE'}")
-
-    stage_dir = Path(STATE["stage_dir"])
+def purge_staging_files(conn, stage_dir: Path, remux_dir: Path) -> int:
+    """Deletes every file in stage_dir, flips every 'staged' decision to
+    'deleted', and cleans up each of those videos' remux_cache/{id}.mp4
+    if one exists (see _ensure_playable) — without that last part, a
+    staged-then-purged video that was ever played through the remux
+    fallback would leave a permanent orphaned copy behind forever, since
+    nothing else ever revisits remux_cache/ once a file's gone. The
+    remux cleanup is keyed off `decisions` (status='staged' at the
+    moment of purge), not off the stage_dir glob — the glob also sweeps
+    any stray file with no matching decision row, which has no video_id
+    to look up a cache entry by anyway. Returns the count of files
+    deleted from stage_dir."""
     deleted = 0
     if stage_dir.is_dir():
         for f in stage_dir.glob("*"):
@@ -635,8 +777,31 @@ async def purge_staging(request: Request):
                 f.unlink()
                 deleted += 1
 
+    staged_ids = [r["preview_id"] for r in conn.execute(
+        "SELECT preview_id FROM decisions WHERE status = 'staged'"
+    ).fetchall()]
+    conn.execute("UPDATE decisions SET status = 'deleted' WHERE status = 'staged'")
+
+    for vid in staged_ids:
+        (remux_dir / f"{vid}.mp4").unlink(missing_ok=True)
+
+    return deleted
+
+
+@app.post("/api/purge-staging")
+async def purge_staging(request: Request):
+    """
+    Permanently deletes everything in the staging folder. Requires
+    {"confirm": "DELETE"} in the body as a deliberate friction point —
+    this is the one truly irreversible action in the whole tool. See
+    purge_staging_files() for what this deletes.
+    """
+    body = await request.json()
+    if body.get("confirm") != "DELETE":
+        raise HTTPException(400, "must confirm with {'confirm': 'DELETE'}")
+
     with connect(STATE["db_path"]) as conn:
-        conn.execute("UPDATE decisions SET status = 'deleted' WHERE status = 'staged'")
+        deleted = purge_staging_files(conn, Path(STATE["stage_dir"]), _remux_cache_dir())
 
     return JSONResponse({"ok": True, "deleted": deleted})
 
@@ -664,23 +829,37 @@ def list_missing_files(conn) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def prune_missing_files(conn) -> int:
+def prune_missing_files(conn, remux_dir: Path) -> list[int]:
     """Permanently deletes the `videos` rows currently flagged missing
     (cascading to their scenes/audio_fp/matches/decisions/match_feedback
     via the existing ON DELETE CASCADE foreign keys — see db.py). This
-    never touches any file on disk — these rows already have no file
-    backing them (that's what "missing" means); pruning only removes
-    the now-meaningless DB history for them.
+    never touches the *source* file on disk — these rows already have
+    no file backing them (that's what "missing" means); pruning only
+    removes the now-meaningless DB history for them.
+
+    Also deletes each pruned video's remux_cache/{id}.mp4 if one exists
+    (see _ensure_playable) — without this, a missing video that was
+    ever played through the remux fallback before going missing would
+    leave a permanent orphaned cache entry behind forever once its row
+    (and every other trace of it) is gone.
 
     Never deletes a video with a 'staged' decision — see
     list_missing_files()'s docstring; same reasoning, same exclusion,
     independently enforced here too, since this is the destructive half.
-    Returns the number of rows deleted."""
-    cur = conn.execute(
-        """DELETE FROM videos WHERE missing_since IS NOT NULL
+
+    Returns the pruned video ids (not just a count)."""
+    ids = [r["id"] for r in conn.execute(
+        """SELECT id FROM videos WHERE missing_since IS NOT NULL
            AND id NOT IN (SELECT preview_id FROM decisions WHERE status = 'staged')"""
-    )
-    return cur.rowcount
+    ).fetchall()]
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM videos WHERE id IN ({placeholders})", ids)
+
+    for vid in ids:
+        (remux_dir / f"{vid}.mp4").unlink(missing_ok=True)
+
+    return ids
 
 
 @app.get("/api/missing-files")
@@ -701,9 +880,9 @@ async def prune_missing_files_route(request: Request):
         raise HTTPException(400, "must confirm with {'confirm': 'DELETE'}")
 
     with connect(STATE["db_path"]) as conn:
-        deleted = prune_missing_files(conn)
+        pruned_ids = prune_missing_files(conn, _remux_cache_dir())
 
-    return JSONResponse({"ok": True, "deleted": deleted})
+    return JSONResponse({"ok": True, "deleted": len(pruned_ids)})
 
 
 # ---------------------------------------------------------------------------

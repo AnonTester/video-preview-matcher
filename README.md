@@ -438,7 +438,8 @@ from a phone without it just rendering a zoomed-out desktop page.
   spotting a confidently-wrong match before trusting it.
 - If a file fails to play in-browser, you'll see an inline message
   instead of a silent failure (most real causes — like the broken-codec-tag
-  issue below — are auto-fixed transparently and shouldn't trigger this).
+  or wrong-container issues below — are auto-fixed transparently and
+  shouldn't trigger this).
 - `D` stages the preview for deletion, `K` keeps it (marks rejected), `X`
   dismisses the currently-selected candidate as "not a match" — distinct
   from `K`: it flags just that one pairing as wrong (remembered, won't be
@@ -496,9 +497,11 @@ subdirectories reached through that one library mount; the SQLite DB
 anywhere persistent.
 
 `<your /data mount>/remux_cache/` also lives there — lossless re-tagged
-copies of any source file whose MP4 codec tag is broken (see "Review
-UI"), built once per affected file on first playback attempt. Budget
-disk space for this if many files turn out to need it; safe to delete
+copies of any source file that isn't directly browser-playable, either
+because its MP4 codec tag is broken or because its actual container
+(regardless of file extension) isn't one a browser understands (see
+"Review UI"), built once per affected file on first playback attempt.
+Budget disk space for this if many files turn out to need it; safe to delete
 the whole directory at any time (rebuilt on next playback).
 
 ## Project layout
@@ -535,9 +538,10 @@ preview-matcher/
 │   ├── procutil_test.py
 │   ├── scene_extraction_timeout_test.py
 │   ├── fingerprint_worker_scaling_test.py
-│   └── fingerprint_write_test.py
+│   ├── fingerprint_write_test.py
+│   └── playback_remux_test.py
 └── data/
     ├── library.db          Created on first run
     ├── subprocess.log      ffmpeg/ffprobe/fpcalc call log (debug)
-    └── remux_cache/        Lossless re-tagged copies for files with broken MP4 codec tags
+    └── remux_cache/        Lossless re-tagged copies for files with a broken MP4 codec tag or wrong container
 ```

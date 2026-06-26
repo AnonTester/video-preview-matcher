@@ -1,5 +1,65 @@
 # Changelog
 
+## 2026-06-26 — 0.14.3
+
+- **Fix (real cleanup gap, found via direct user question before it
+  caused a real complaint): `remux_cache/{id}.mp4` was never deleted
+  when its video stopped existing.** `/api/purge-staging` permanently
+  deletes a staged file but never touched a cached remux of it (built
+  if anyone played it before purging); `/api/missing-files/prune`
+  cascades away a video's entire DB history but nothing ever pointed
+  back at its remux cache entry either. Both would have leaked an
+  orphaned copy on disk forever. Fixed by extracting both endpoints'
+  core logic into pure, testable functions (`purge_staging_files`,
+  and `prune_missing_files` which now also takes the remux cache dir)
+  that delete each affected video's `remux_cache/{id}.mp4` as part of
+  the same operation — keyed off exactly the ids being purged/pruned,
+  never a directory-wide sweep. The live cache had exactly one entry at
+  the time (not orphaned), so no retroactive cleanup was needed, only
+  the prospective fix.
+
+## 2026-06-26 — 0.14.2
+
+- **Review page card redesign.** Each video-comparison card's header
+  showed the filename right next to the "preview"/"matched full
+  version" tag, with the full path repeated as a single line below it —
+  redundant, and left no room for duration/resolution/filesize. The
+  header now shows those three (human-readable, right-aligned) instead
+  of the filename; the path line below is now folder on its own line,
+  filename on the next. Computed server-side (`_fmt_video_meta` in
+  `04_serve.py`) for the initial render, mirrored in JS (`fmtVideoMeta`)
+  for the candidate panel, which re-renders without a page reload when
+  switching between match candidates. Mobile: `.panel-head` now stacks
+  the tag and meta into a column instead of one row, since the tag
+  alone wrapping to two lines was squeezing meta down to where it got
+  truncated mid-word.
+- **Fix (real bug, found via user report — video #5855): a file named
+  `*.mp4` was actually raw MPEG-TS, and failed to play with "no video
+  with supported format and MIME type found."** The existing broken-
+  codec-tag fix only ever checked `codec_tag`, which for this file is a
+  real, non-zero MPEG-TS stream_type (not the broken-MP4-tag pattern at
+  all), so it never triggered a remux. Widened the check
+  (`_probe_playability`/`_parse_playability` in `04_serve.py`, replacing
+  `_has_broken_codec_tag`) to also remux when the file's actual
+  container (`ffprobe`'s `format_name`) isn't one a browser understands,
+  regardless of extension or codec_tag.
+- **Safety fix found while building the above, before it shipped:
+  applying the codec-tag check container-agnostically would have
+  flagged every real `.mkv`/`.webm` file in the library as "broken."**
+  ffprobe reports `codec_tag=0x0000` for every Matroska-family file
+  unconditionally — normal, not a defect. `matroska`/`webm` are now
+  explicitly exempt from both checks. Verified live against this
+  library's real files: a real `.mkv` is still served directly with no
+  remux triggered; video #5855 now gets correctly remuxed into a clean
+  MP4 with proper `avc1`/`mp4a` tags.
+- **A second safety check, found by inspecting the library's actual
+  codec mix rather than by an incident:** the remux hardcodes
+  `-tag:v avc1 -tag:a mp4a`, correct only for h264 video with aac (or
+  no) audio. This library has a handful of av1/hevc/vp9 videos — forcing
+  avc1 onto one of those would mislabel it, not fix it. `_ensure_playable`
+  now checks `_safe_to_remux` before ever invoking ffmpeg, falling back
+  to the original file (same as a failed remux) when it fails.
+
 ## 2026-06-26 — 0.14.1
 
 - **Fix (real bug, found via user report): an Android mobile browser

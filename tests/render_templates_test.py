@@ -66,13 +66,15 @@ def build_index_context(db_path, tab="pending", page=1):
 
 
 def build_review_context(db_path, preview_id):
+    import os
     with connect(db_path) as conn:
         preview = dict(conn.execute("SELECT * FROM videos WHERE id = ?", (preview_id,)).fetchone())
         candidates = conn.execute(
             """
             SELECT m.*, c.filename AS candidate_filename, c.path AS candidate_path,
                    c.duration_sec AS candidate_duration,
-                   c.width AS candidate_width, c.height AS candidate_height
+                   c.width AS candidate_width, c.height AS candidate_height,
+                   c.size_bytes AS candidate_size_bytes
             FROM matches m JOIN videos c ON c.id = m.candidate_id
             WHERE m.preview_id = ?
             ORDER BY m.combined_score DESC
@@ -87,10 +89,16 @@ def build_review_context(db_path, preview_id):
     for c in candidates:
         d = dict(c)
         d["scene_matches"] = json.loads(d["scene_matches_json"]) if d["scene_matches_json"] else []
+        d["candidate_meta"] = serve_mod._fmt_video_meta(d["candidate_duration"], d["candidate_width"],
+                                                         d["candidate_height"], d["candidate_size_bytes"])
+        d["candidate_folder"] = os.path.dirname(d["candidate_path"])
         candidates_parsed.append(d)
 
     return {
         "preview": preview,
+        "preview_meta": serve_mod._fmt_video_meta(preview["duration_sec"], preview["width"], preview["height"],
+                                                    preview["size_bytes"]),
+        "preview_folder": os.path.dirname(preview["path"]),
         "candidates": candidates_parsed,
         "decision": dict(decision) if decision else None,
         "preview_scene_count": preview_scene_count,

@@ -518,10 +518,11 @@ a { color: inherit; }
   color: var(--text-faint);
 }
 
-.video-panel .panel-head .fname {
+.video-panel .panel-head .meta {
   font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text);
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -529,10 +530,22 @@ a { color: inherit; }
 }
 
 .panel-path {
+  padding: 0 14px 8px;
+}
+
+.panel-folder {
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  padding: 0 14px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-filename {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -907,6 +920,21 @@ kbd {
 
   .compare-grid {
     grid-template-columns: 1fr;
+  }
+
+  /* .panel-head's tag + meta share one row on desktop, each with room
+     to breathe; on a narrow card the tag alone can wrap to two lines,
+     squeezing meta's already-tight max-width down further and
+     truncating it mid-word. Stack them instead, each at full width. */
+  .video-panel .panel-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .video-panel .panel-head .meta {
+    text-align: left;
+    max-width: 100%;
   }
 
   .score-panel {
