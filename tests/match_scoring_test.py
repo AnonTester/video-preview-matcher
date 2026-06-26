@@ -248,6 +248,51 @@ def test_score_pair_clustered_matches_have_small_spread():
     print("test_score_pair_clustered_matches_have_small_spread: OK")
 
 
+def test_score_pair_repeated_intro_has_zero_candidate_spread():
+    # video #4059: a ~2.8s intro appears three times in the preview, well
+    # spread out (a real reused intro, not a rapid-cut sting — clears
+    # --min-match-spread on the preview side), but the candidate only has
+    # it once, so all three matches collapse onto the same single
+    # candidate timestamp. Preview-side spread alone can't catch this —
+    # it's exactly what candidate_match_spread_sec exists to catch.
+    scenes_by_video = {
+        1: _video_scenes([
+            (1.0, "ff00ff00ff00ff00", None),
+            (50.0, "ff00ff00ff00ff00", None),
+            (100.0, "ff00ff00ff00ff00", None),
+        ]),
+        2: _video_scenes([(5.0, "ff00ff00ff00ff00", None)]),
+    }
+    res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    assert len(res["scene_matches"]) == 3
+    assert res["match_spread_sec"] == 99.0, res["match_spread_sec"]
+    assert res["candidate_match_spread_sec"] == 0.0, res["candidate_match_spread_sec"]
+    print("test_score_pair_repeated_intro_has_zero_candidate_spread: OK")
+
+
+def test_score_pair_independent_matches_have_spread_on_both_sides():
+    # The legitimate counterpart to the above: three genuinely distinct
+    # preview scenes matching three genuinely distinct candidate scenes
+    # should show real spread on both sides, not get penalized by the
+    # new check.
+    scenes_by_video = {
+        1: _video_scenes([
+            (1.0, "ff00ff00ff00ff00", None),
+            (50.0, "00ff00ff00ff00ff", None),
+            (100.0, "ffff0000ffff0000", None),
+        ]),
+        2: _video_scenes([
+            (10.0, "ff00ff00ff00ff00", None),
+            (200.0, "00ff00ff00ff00ff", None),
+            (400.0, "ffff0000ffff0000", None),
+        ]),
+    }
+    res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    assert res["match_spread_sec"] == 99.0, res["match_spread_sec"]
+    assert res["candidate_match_spread_sec"] == 390.0, res["candidate_match_spread_sec"]
+    print("test_score_pair_independent_matches_have_spread_on_both_sides: OK")
+
+
 def test_chunk_pairs_empty_list():
     assert match_mod._chunk_pairs([], workers=4) == []
     print("test_chunk_pairs_empty_list: OK")
@@ -431,6 +476,8 @@ if __name__ == "__main__":
     test_score_pair_perfect_visual_match_no_audio()
     test_score_pair_single_match_has_zero_spread()
     test_score_pair_clustered_matches_have_small_spread()
+    test_score_pair_repeated_intro_has_zero_candidate_spread()
+    test_score_pair_independent_matches_have_spread_on_both_sides()
     test_trim_worker_memory_does_not_raise()
     test_score_chunk_result_unaffected_by_memory_trim()
     test_record_candidate_keeps_only_top_n_per_preview()

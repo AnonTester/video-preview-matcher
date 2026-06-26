@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-26 — 0.14.1
+
+- **Fix (real bug, found via user report): an Android mobile browser
+  kept serving a stale `style.css` after a deploy.** `/static/style.css`
+  is now referenced as `/static/style.css?v={{ app_version }}` in both
+  templates, so the URL itself changes on every version bump instead of
+  relying on cache-control headers — `review_detail()` now passes
+  `app_version` into its template context too (it didn't before), so
+  this covers `/review/{id}` as well as `/`.
+- **Fix (real false positive, found via real review — video #4059): a
+  fifth false-positive class, where several matches spread out in the
+  preview all collapse onto the *same single moment in the candidate*.**
+  A ~2.8s intro appeared three separate times in the preview (well
+  spread out — clearing `--min-match-spread`), but the candidate only
+  had that intro once, so all three matches pointed at one candidate
+  timestamp; the candidate wasn't actually a match. `--min-match-spread`
+  only ever checks the preview side, so it couldn't see this. Added
+  `--min-candidate-match-spread` (default 2.0s, mirrors `--min-match-
+  spread`): `score_pair()` now also computes `candidate_match_spread_sec`
+  over the matched scenes' `candidate_ts` values, and both spread checks
+  must pass — corroboration needs independence on both sides, not just
+  one. The review UI's "Match details" summary now reports both spans
+  and flags it explicitly when matches collapse onto one candidate
+  moment despite a wide preview-side spread.
+
 ## 2026-06-25 — 0.14.0
 
 - **Fix (real production incident, found via user report): staging a

@@ -64,6 +64,29 @@ SPREAD (--min-match-spread, default 2.0s):
     tune with real false positives/negatives in hand, same as
     --hash-threshold's history above.
 
+CANDIDATE-SIDE MATCH SPREAD (--min-candidate-match-spread, default 2.0s):
+    A third false-positive class, found via real review (video #4059):
+    a ~2.8s intro/bumper appeared *three separate times* in the preview
+    (spliced in at three different points — a real preview re-using its
+    own intro, not a rapid-cut sting), each cleanly above
+    --min-scene-duration and spread well past --min-match-spread on the
+    *preview* side. All three matched the *same single* candidate
+    timestamp, because the candidate only has that intro once. The
+    candidate itself was not actually a match at all — three repeats of
+    one shared, genuinely-coincidental clip (a generic studio bumper) is
+    not three independent corroborating moments, no matter how spread
+    out they are in the preview. --min-match-spread didn't catch this
+    because it only ever looked at the preview side; the *candidate*-side
+    timestamps of those three matches were all identical (or
+    near-identical), which is exactly the signal that's actually
+    missing. --min-candidate-match-spread mirrors --min-match-spread
+    but requires spread among the matched scenes' *candidate* timestamps
+    instead — three matches that collapse onto one candidate moment now
+    fail this regardless of how spread out they are in the preview.
+    Both spread checks must pass; either axis alone is insufficient,
+    since a real match needs corroboration that's independent on *both*
+    sides, not just one.
+
 AUDIO SCORE:
     Chromaprint fingerprints are compared only when both sides have one
     (fp_ok=1). A previewer with narration dubbed over the original audio
@@ -285,6 +308,7 @@ Usage:
                              [--max-ratio 0.95] [--top-n 5]
                              [--min-visual-score 0.15] [--min-matched-scenes 3]
                              [--min-scene-duration 2.0] [--min-match-spread 2.0]
+                             [--min-candidate-match-spread 2.0]
                              [--workers N]
 """
 
@@ -505,6 +529,17 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
         if len(matched) > 1 else 0.0
     )
 
+    # Mirror of match_spread_sec on the *candidate* side — see module
+    # docstring's CANDIDATE-SIDE MATCH SPREAD section. Several preview
+    # scenes spread across the preview can still all be the same single
+    # shared moment if they all best-match the same candidate timestamp;
+    # this is the signal that actually catches that, where match_spread_sec
+    # (preview-only) does not.
+    candidate_match_spread_sec = (
+        max(m["candidate_ts"] for m in matched) - min(m["candidate_ts"] for m in matched)
+        if len(matched) > 1 else 0.0
+    )
+
     # Audio score (only if both sides have a usable fingerprint)
     audio_score = None
     p_audio = audio_by_video.get(preview_id)
@@ -523,6 +558,7 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
         "combined_score": combined,
         "scene_matches": matched,
         "match_spread_sec": match_spread_sec,
+        "candidate_match_spread_sec": candidate_match_spread_sec,
     }
 
 
@@ -791,6 +827,11 @@ def main():
                      help="skip storing matches whose matched scenes' preview timestamps span less than this "
                           "many seconds — several hits clustered in the same narrow moment aren't independent "
                           "corroboration; see module docstring's MATCH SPREAD section")
+    ap.add_argument("--min-candidate-match-spread", type=float, default=2.0,
+                     help="skip storing matches whose matched scenes' candidate timestamps span less than this "
+                          "many seconds — several preview-side hits that all best-match the *same* candidate "
+                          "moment aren't independent corroboration either, even if they're well spread out "
+                          "in the preview; see module docstring's CANDIDATE-SIDE MATCH SPREAD section")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
                      help="parallel scoring processes (pure CPU-bound, no I/O contention — unlike "
                           "02_fingerprint.py's --workers, more cores should mostly just help here, but "
@@ -901,7 +942,8 @@ def main():
             res = score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, args.hash_threshold, args.color_threshold)
             if (res and res["visual_score"] >= args.min_visual_score
                     and len(res["scene_matches"]) >= args.min_matched_scenes
-                    and res["match_spread_sec"] >= args.min_match_spread):
+                    and res["match_spread_sec"] >= args.min_match_spread
+                    and res["candidate_match_spread_sec"] >= args.min_candidate_match_spread):
                 _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
 
             if i % 500 == 0:
@@ -939,7 +981,8 @@ def main():
                     for preview_id, candidate_id, res in fut.result():
                         if (res and res["visual_score"] >= args.min_visual_score
                                 and len(res["scene_matches"]) >= args.min_matched_scenes
-                                and res["match_spread_sec"] >= args.min_match_spread):
+                                and res["match_spread_sec"] >= args.min_match_spread
+                                and res["candidate_match_spread_sec"] >= args.min_candidate_match_spread):
                             _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
                     done_pairs += futures[fut]
                     print(f"  ...{done_pairs:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")

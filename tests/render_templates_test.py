@@ -97,6 +97,7 @@ def build_review_context(db_path, preview_id):
         "request": None,
         "back_tab": "pending",
         "back_page": 1,
+        "app_version": "test",
     }
 
 

@@ -278,6 +278,17 @@ calibrated values. Expect to spend real time here:
   corroboration just because there happen to be `--min-matched-scenes`
   of them. Same starting-point caveat as `--min-scene-duration` above.
 
+- **`--min-candidate-match-spread`** (`03_match.py`, default `2.0`
+  seconds): the same spread check, mirrored onto the matched scenes'
+  *candidate* timestamps. Added after a real false positive (review
+  video #4059): a ~2.8s intro appeared three separate times in the
+  preview, well spread out — clearing `--min-match-spread` on the
+  preview side — but the candidate only had that intro once, so all
+  three matches collapsed onto one candidate timestamp. The candidate
+  wasn't a match at all; `--min-match-spread` alone can't see that,
+  since it never looks at the candidate side. Both spread checks must
+  pass — corroboration needs independence on both sides, not just one.
+
 - **Audio scoring** (`chromaprint_similarity` in `03_match.py`): shipped
   as a deliberately simple bit-overlap comparator, explicitly flagged in
   its docstring as a placeholder. Since previews here may have narration
@@ -419,9 +430,10 @@ from a phone without it just rendering a zoomed-out desktop page.
   shared-intro/logo false-positive pattern that `--min-scene-duration`
   guards against, see "Tuning"), and crop/flip variant, plus a summary
   line stating whether the matches spread across multiple distinct
-  moments in the preview or are a single isolated point (a single match
-  is weak, coincidental-prone evidence — see "Tuning" →
-  `--min-matched-scenes`/`--min-match-spread`) — useful for judging a
+  moments in *both* the preview and the candidate, or collapse onto a
+  single point in either one (weak, coincidental-prone evidence either
+  way — see "Tuning" → `--min-matched-scenes`/`--min-match-spread`/
+  `--min-candidate-match-spread`) — useful for judging a
   match even when (or especially when) playback isn't available, and for
   spotting a confidently-wrong match before trusting it.
 - If a file fails to play in-browser, you'll see an inline message

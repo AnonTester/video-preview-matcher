@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Review — {{ preview.filename }}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
 </head>
 <body>
 
@@ -206,8 +206,17 @@
       let spanText = '';
       if (sorted.length > 1) {
         const previewTs = sorted.map(m => m.preview_ts);
+        const candidateTs = sorted.map(m => m.candidate_ts);
         const previewSpan = Math.max(...previewTs) - Math.min(...previewTs);
-        spanText = ` — spread across ${fmtTime(previewSpan)} of the preview`;
+        const candidateSpan = Math.max(...candidateTs) - Math.min(...candidateTs);
+        spanText = ` — spread across ${fmtTime(previewSpan)} of the preview and ${fmtTime(candidateSpan)} of the candidate`;
+        // A near-zero candidate-side spread despite a wide preview-side
+        // spread means every match collapses onto the same candidate
+        // moment — repeated corroboration of one shared clip, not
+        // several independent ones (see CLAUDE.md, video #4059).
+        if (candidateSpan < 2.0) {
+          spanText += ' — all land on roughly the same candidate moment, weak evidence despite the preview-side spread';
+        }
       } else if (sorted.length === 1) {
         spanText = ' — a single isolated match, not spread across multiple moments (weak evidence on its own)';
       }

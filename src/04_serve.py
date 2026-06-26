@@ -331,6 +331,7 @@ def review_detail(request: Request, preview_id: int, tab: str = "pending", page:
         "preview_scene_count": preview_scene_count,
         "back_tab": tab if tab in ("pending", "staged") else "pending",
         "back_page": page,
+        "app_version": APP_VERSION,
     })
 
 
