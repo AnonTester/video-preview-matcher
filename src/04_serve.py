@@ -232,16 +232,16 @@ PAGE_SIZE = 40
 
 # Shared between queue_rows() and _pending_total() so the two can never
 # drift apart (the count must describe exactly the same set the rows are
-# a page of). AND (d.status IS NULL OR d.status != 'staged') is what
-# keeps a staged preview out of the pending tab once it has one — the
-# staged tab (staged_queue_rows() below) is where it lives instead.
+# a page of). d.status IS NULL is what keeps a staged/rejected preview
+# out of the pending tab once it has either decision — staged_queue_rows/
+# rejected_queue_rows below are where those live instead.
 _PENDING_FROM_WHERE = """
     FROM matches m
     JOIN videos p ON p.id = m.preview_id
     JOIN videos c ON c.id = m.candidate_id
     LEFT JOIN decisions d ON d.preview_id = m.preview_id
     WHERE p.missing_since IS NULL AND c.missing_since IS NULL
-    AND (d.status IS NULL OR d.status != 'staged')
+    AND d.status IS NULL
     AND m.id IN (
         SELECT m2.id FROM matches m2
         JOIN videos c2 ON c2.id = m2.candidate_id
@@ -255,17 +255,14 @@ def _pending_total(conn) -> int:
     return conn.execute(f"SELECT COUNT(*) AS n {_PENDING_FROM_WHERE}").fetchone()["n"]
 
 
-def _staged_total(conn) -> int:
-    return conn.execute("SELECT COUNT(*) AS n FROM decisions WHERE status = 'staged'").fetchone()["n"]
+def _decision_total(conn, status: str) -> int:
+    return conn.execute("SELECT COUNT(*) AS n FROM decisions WHERE status = ?", (status,)).fetchone()["n"]
 
 
 def queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
-    """One row per *pending* preview (not yet staged — see
-    staged_queue_rows() for that bucket), with its best match among
-    non-missing candidates, ordered worst-decided-first (highest
-    confidence and not yet decided floats to the top; a rejected
-    preview, having no file consequence either way, just sinks toward
-    the bottom rather than getting its own tab). A preview whose
+    """One row per *pending* (truly undecided — staged and rejected each
+    have their own tab/function below) preview, with its best match
+    among non-missing candidates, ordered by confidence. A preview whose
     candidates are *all* missing matches nothing here and is correctly
     absent — a preview with a missing *top* candidate but a viable
     second-best one still surfaces with that one, rather than
@@ -279,51 +276,64 @@ def queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[di
     rows = conn.execute(
         f"""
         SELECT
-            m.preview_id, p.filename AS preview_filename, p.duration_sec AS preview_duration,
-            m.candidate_id, c.filename AS candidate_filename, c.duration_sec AS candidate_duration,
-            m.visual_score, m.audio_score, m.combined_score,
-            d.status AS decision_status
+            m.preview_id, p.filename AS preview_filename,
+            m.candidate_id, c.filename AS candidate_filename,
+            m.visual_score, m.audio_score, m.combined_score
         {_PENDING_FROM_WHERE}
-        ORDER BY (d.status IS NOT NULL) ASC, m.combined_score DESC
+        ORDER BY m.combined_score DESC
         LIMIT ? OFFSET ?
         """,
         (page_size, (page - 1) * page_size),
+    ).fetchall()
+    return [dict(r) for r in rows], total
+
+
+def _decision_queue_rows(conn, status: str, page: int, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
+    """Staged or rejected previews — read directly from `decisions`,
+    deliberately *not* through `matches` the way queue_rows() does.
+    Found necessary via a real incident (staged, but the same reasoning
+    covers rejected too): a preview that's been decided and re-scored by
+    a later 03_match.py run can drop below threshold and lose its
+    `matches` row entirely (matches is fully recomputed every run — see
+    Architecture in CLAUDE.md), and — for staged specifically —
+    01_inventory.py naturally flags its now-staged-away original path
+    missing on the next scan. Either one alone used to make an
+    already-decided preview vanish from every view in the UI, with its
+    `decisions` row — the only record of how to undo it (see
+    review.html's decision-banner/undo button, which works for any
+    decision status, not just staged) — becoming unreachable through any
+    link. Sourcing straight from `decisions` instead means a decided
+    preview stays visible and undoable regardless of what matching or
+    inventory do later; missing_since is intentionally not checked
+    anywhere here. Returns (rows_for_this_page, total_count)."""
+    page = max(1, page)
+    total = _decision_total(conn, status)
+    rows = conn.execute(
+        """
+        SELECT d.preview_id, p.filename AS preview_filename,
+               d.matched_candidate_id AS candidate_id, c.filename AS candidate_filename,
+               d.decided_at
+        FROM decisions d
+        JOIN videos p ON p.id = d.preview_id
+        LEFT JOIN videos c ON c.id = d.matched_candidate_id
+        WHERE d.status = ?
+        ORDER BY d.decided_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (status, page_size, (page - 1) * page_size),
     ).fetchall()
     return [dict(r) for r in rows], total
 
 
 def staged_queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
-    """Staged previews — read directly from `decisions`, deliberately
-    *not* through `matches` the way queue_rows() does. Found necessary
-    via a real incident: a preview that's been approved-for-deletion and
-    re-scored by a later 03_match.py run can drop below threshold and
-    lose its `matches` row entirely (matches is fully recomputed every
-    run — see Architecture in CLAUDE.md), and 01_inventory.py naturally
-    flags its now-staged-away original path missing on the next scan.
-    Either one alone used to make an already-staged preview vanish from
-    every view in the UI, with its `decisions` row — the only record of
-    where to undo it back to — becoming unreachable through any link.
-    Sourcing straight from `decisions` instead means a staged preview
-    stays visible and undoable regardless of what matching or inventory
-    do later; missing_since is intentionally not checked anywhere here.
-    Returns (rows_for_this_page, total_staged_count)."""
-    page = max(1, page)
-    total = _staged_total(conn)
-    rows = conn.execute(
-        """
-        SELECT d.preview_id, p.filename AS preview_filename, p.duration_sec AS preview_duration,
-               d.matched_candidate_id AS candidate_id, c.filename AS candidate_filename,
-               c.duration_sec AS candidate_duration, d.decided_at
-        FROM decisions d
-        JOIN videos p ON p.id = d.preview_id
-        LEFT JOIN videos c ON c.id = d.matched_candidate_id
-        WHERE d.status = 'staged'
-        ORDER BY d.decided_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        (page_size, (page - 1) * page_size),
-    ).fetchall()
-    return [dict(r) for r in rows], total
+    return _decision_queue_rows(conn, "staged", page, page_size)
+
+
+def rejected_queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[list[dict], int]:
+    return _decision_queue_rows(conn, "rejected", page, page_size)
+
+
+QUEUE_TABS = ("pending", "staged", "rejected")
 
 
 def _queue_page_data(conn, tab: str, page: int) -> dict:
@@ -335,10 +345,15 @@ def _queue_page_data(conn, tab: str, page: int) -> dict:
     into index() like before."""
     if tab == "staged":
         matches, total = staged_queue_rows(conn, page)
-        pending_count, staged_count = _pending_total(conn), total
+    elif tab == "rejected":
+        matches, total = rejected_queue_rows(conn, page)
     else:
         matches, total = queue_rows(conn, page)
-        pending_count, staged_count = total, _staged_total(conn)
+
+    pending_count = total if tab == "pending" else _pending_total(conn)
+    staged_count = total if tab == "staged" else _decision_total(conn, "staged")
+    rejected_count = total if tab == "rejected" else _decision_total(conn, "rejected")
+
     total_pages = max(1, math.ceil(total / PAGE_SIZE))
     return {
         "matches": matches,
@@ -348,12 +363,13 @@ def _queue_page_data(conn, tab: str, page: int) -> dict:
         "total_count": total,
         "pending_count": pending_count,
         "staged_count": staged_count,
+        "rejected_count": rejected_count,
     }
 
 
 @app.get("/api/queue")
 def api_queue(tab: str = "pending", page: int = 1):
-    tab = tab if tab in ("pending", "staged") else "pending"
+    tab = tab if tab in QUEUE_TABS else "pending"
     page = max(1, page)
     with connect(STATE["db_path"]) as conn:
         return _queue_page_data(conn, tab, page)
@@ -361,7 +377,7 @@ def api_queue(tab: str = "pending", page: int = 1):
 
 @app.get("/")
 def index(request: Request, tab: str = "pending", page: int = 1):
-    tab = tab if tab in ("pending", "staged") else "pending"
+    tab = tab if tab in QUEUE_TABS else "pending"
     page = max(1, page)
 
     with connect(STATE["db_path"]) as conn:
@@ -423,7 +439,7 @@ def review_detail(request: Request, preview_id: int, tab: str = "pending", page:
         "candidates": candidates_parsed,
         "decision": dict(decision) if decision else None,
         "preview_scene_count": preview_scene_count,
-        "back_tab": tab if tab in ("pending", "staged") else "pending",
+        "back_tab": tab if tab in QUEUE_TABS else "pending",
         "back_page": page,
         "app_version": APP_VERSION,
     })

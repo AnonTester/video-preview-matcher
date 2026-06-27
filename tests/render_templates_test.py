@@ -37,12 +37,7 @@ spec.loader.exec_module(serve_mod)
 
 def build_index_context(db_path, tab="pending", page=1):
     with connect(db_path) as conn:
-        if tab == "staged":
-            rows, total = serve_mod.staged_queue_rows(conn, page)
-            pending_count, staged_count = serve_mod._pending_total(conn), total
-        else:
-            rows, total = serve_mod.queue_rows(conn, page)
-            pending_count, staged_count = total, serve_mod._staged_total(conn)
+        data = serve_mod._queue_page_data(conn, tab, page)
 
         stats = conn.execute(
             """
@@ -56,13 +51,7 @@ def build_index_context(db_path, tab="pending", page=1):
             """
         ).fetchone()
 
-    import math
-    total_pages = max(1, math.ceil(total / serve_mod.PAGE_SIZE))
-    return {
-        "matches": rows, "stats": dict(stats), "app_version": "test", "request": None,
-        "tab": tab, "page": page, "total_pages": total_pages, "total_count": total,
-        "pending_count": pending_count, "staged_count": staged_count,
-    }
+    return {**data, "stats": dict(stats), "app_version": "test", "request": None}
 
 
 def build_review_context(db_path, preview_id):
@@ -127,6 +116,13 @@ def main():
     assert "Preview Matcher" in sout
     assert "Staged for deletion" in sout
     print(f"  OK — {len(sout)} chars, {len(sctx['matches'])} staged rows.")
+
+    print("Rendering index.html (rejected tab) ...")
+    rjctx = build_index_context(db_path, tab="rejected")
+    rjout = tpl.render(**rjctx)
+    assert "Preview Matcher" in rjout
+    assert "Rejected —" in rjout
+    print(f"  OK — {len(rjout)} chars, {len(rjctx['matches'])} rejected rows.")
 
     if ctx["matches"]:
         preview_id = ctx["matches"][0]["preview_id"]

@@ -193,10 +193,9 @@ def test_queue_rows_excludes_staged_preview():
     print("test_queue_rows_excludes_staged_preview: OK")
 
 
-def test_queue_rows_includes_rejected_preview():
-    """Unlike 'staged', 'rejected' previews stay in the pending tab
-    (sunk to the bottom via decision_status, not split into their own
-    tab) — only confirmed deletions get a dedicated tab."""
+def test_queue_rows_excludes_rejected_preview():
+    """A rejected preview belongs in rejected_queue_rows()'s bucket, not
+    here — same pending-tab/staged-tab/rejected-tab three-way split."""
     reset()
     with connect(TMP_DB) as conn:
         _seed_video(conn, 1)
@@ -204,10 +203,9 @@ def test_queue_rows_includes_rejected_preview():
         _seed_match(conn, 1, 2, 0.9)
         _seed_decision(conn, 1, "rejected")
         rows, total = serve_mod.queue_rows(conn)
-    assert [r["preview_id"] for r in rows] == [1]
-    assert rows[0]["decision_status"] == "rejected"
-    assert total == 1
-    print("test_queue_rows_includes_rejected_preview: OK")
+    assert rows == [], rows
+    assert total == 0
+    print("test_queue_rows_excludes_rejected_preview: OK")
 
 
 def test_queue_rows_paginates():
@@ -282,24 +280,76 @@ def test_staged_queue_rows_orders_most_recently_staged_first():
     print("test_staged_queue_rows_orders_most_recently_staged_first: OK")
 
 
-def test_queue_page_data_pending_tab():
-    """_queue_page_data is what both index() (HTML) and /api/queue
-    (JSON, used by the queue page's AJAX tab/pagination switching — see
-    index.html's loadQueue()) build their response from — must stay in
-    sync with queue_rows()/staged_queue_rows()'s own counts."""
+def test_rejected_queue_rows_includes_rejected_preview_independent_of_matches():
+    """Same reasoning as staged_queue_rows (see its docstring), applied
+    to rejected: a rejected preview must stay visible/undoable even with
+    no `matches` row at all."""
     reset()
     with connect(TMP_DB) as conn:
         _seed_video(conn, 1)
         _seed_video(conn, 2)
-        _seed_match(conn, 1, 2, 0.9)
-        _seed_video(conn, 3)
-        _seed_decision(conn, 3, "staged")
+        # Deliberately no _seed_match() call — no matches row exists.
+        _seed_decision(conn, 1, "rejected", matched_candidate_id=2, decided_at=5.0)
+        rows, total = serve_mod.rejected_queue_rows(conn)
+    assert total == 1
+    assert rows[0]["preview_id"] == 1
+    assert rows[0]["candidate_id"] == 2
+    assert rows[0]["candidate_filename"] == "2.mp4"
+    print("test_rejected_queue_rows_includes_rejected_preview_independent_of_matches: OK")
+
+
+def test_rejected_queue_rows_excludes_non_rejected_decisions():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_decision(conn, 1, "staged")
+        rows, total = serve_mod.rejected_queue_rows(conn)
+    assert rows == [] and total == 0
+    print("test_rejected_queue_rows_excludes_non_rejected_decisions: OK")
+
+
+def test_rejected_queue_rows_orders_most_recently_rejected_first():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_decision(conn, 1, "rejected", decided_at=1.0)
+        _seed_decision(conn, 2, "rejected", decided_at=2.0)
+        rows, total = serve_mod.rejected_queue_rows(conn)
+    assert total == 2
+    assert [r["preview_id"] for r in rows] == [2, 1]
+    print("test_rejected_queue_rows_orders_most_recently_rejected_first: OK")
+
+
+def _seed_three_tab_fixture(conn):
+    """One preview in each bucket: #1 truly pending, #3 staged, #5
+    rejected — shared by the three _queue_page_data tests below so
+    their counts can't accidentally agree by coincidence."""
+    _seed_video(conn, 1)
+    _seed_video(conn, 2)
+    _seed_match(conn, 1, 2, 0.9)
+    _seed_video(conn, 3)
+    _seed_decision(conn, 3, "staged")
+    _seed_video(conn, 5)
+    _seed_decision(conn, 5, "rejected")
+
+
+def test_queue_page_data_pending_tab():
+    """_queue_page_data is what both index() (HTML) and /api/queue
+    (JSON, used by the queue page's AJAX tab/pagination switching — see
+    index.html's loadQueue()) build their response from — must stay in
+    sync with queue_rows()/staged_queue_rows()/rejected_queue_rows()'s
+    own counts."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_three_tab_fixture(conn)
         data = serve_mod._queue_page_data(conn, "pending", 1)
     assert data["tab"] == "pending"
     assert data["page"] == 1
     assert data["total_count"] == 1
     assert data["pending_count"] == 1
     assert data["staged_count"] == 1
+    assert data["rejected_count"] == 1
     assert data["total_pages"] == 1
     assert [m["preview_id"] for m in data["matches"]] == [1]
     print("test_queue_page_data_pending_tab: OK")
@@ -308,18 +358,29 @@ def test_queue_page_data_pending_tab():
 def test_queue_page_data_staged_tab():
     reset()
     with connect(TMP_DB) as conn:
-        _seed_video(conn, 1)
-        _seed_video(conn, 2)
-        _seed_match(conn, 1, 2, 0.9)
-        _seed_video(conn, 3)
-        _seed_decision(conn, 3, "staged")
+        _seed_three_tab_fixture(conn)
         data = serve_mod._queue_page_data(conn, "staged", 1)
     assert data["tab"] == "staged"
     assert data["total_count"] == 1
     assert data["pending_count"] == 1
     assert data["staged_count"] == 1
+    assert data["rejected_count"] == 1
     assert [m["preview_id"] for m in data["matches"]] == [3]
     print("test_queue_page_data_staged_tab: OK")
+
+
+def test_queue_page_data_rejected_tab():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_three_tab_fixture(conn)
+        data = serve_mod._queue_page_data(conn, "rejected", 1)
+    assert data["tab"] == "rejected"
+    assert data["total_count"] == 1
+    assert data["pending_count"] == 1
+    assert data["staged_count"] == 1
+    assert data["rejected_count"] == 1
+    assert [m["preview_id"] for m in data["matches"]] == [5]
+    print("test_queue_page_data_rejected_tab: OK")
 
 
 def test_build_cmd_inventory_includes_roots_and_limit():
@@ -820,12 +881,15 @@ if __name__ == "__main__":
     test_queue_rows_falls_back_to_second_best_when_top_candidate_missing()
     test_queue_rows_excludes_preview_when_all_candidates_missing()
     test_queue_rows_excludes_staged_preview()
-    test_queue_rows_includes_rejected_preview()
+    test_queue_rows_excludes_rejected_preview()
     test_queue_rows_paginates()
     test_staged_queue_rows_includes_staged_preview_independent_of_matches()
     test_staged_queue_rows_includes_staged_preview_even_when_missing()
     test_staged_queue_rows_excludes_non_staged_decisions()
     test_staged_queue_rows_orders_most_recently_staged_first()
+    test_rejected_queue_rows_includes_rejected_preview_independent_of_matches()
+    test_rejected_queue_rows_excludes_non_rejected_decisions()
+    test_rejected_queue_rows_orders_most_recently_rejected_first()
     test_list_missing_files_excludes_staged()
     test_list_missing_files_includes_rejected_and_undecided()
     test_prune_missing_files_never_deletes_a_staged_video()
@@ -838,6 +902,7 @@ if __name__ == "__main__":
     test_purge_staging_files_leaves_other_remux_cache_entries_alone()
     test_queue_page_data_pending_tab()
     test_queue_page_data_staged_tab()
+    test_queue_page_data_rejected_tab()
     test_build_cmd_inventory_includes_roots_and_limit()
     test_build_cmd_includes_debug_log_for_inventory_and_fingerprint()
     test_build_cmd_inventory_omits_limit_when_not_set()

@@ -97,11 +97,17 @@
       <h1 id="queue-title">
         {% if tab == 'staged' %}
           Staged for deletion — {{ total_count }} preview{{ "" if total_count == 1 else "s" }}
+        {% elif tab == 'rejected' %}
+          Rejected — {{ total_count }} preview{{ "" if total_count == 1 else "s" }}
         {% else %}
           Review queue — {{ total_count }} preview{{ "" if total_count == 1 else "s" }} with a candidate match
         {% endif %}
       </h1>
-      <span class="sub" id="queue-sub">{{ "most recently staged first" if tab == 'staged' else "sorted by confidence, undecided first" }}</span>
+      <span class="sub" id="queue-sub">
+        {% if tab == 'staged' %}most recently staged first
+        {% elif tab == 'rejected' %}most recently rejected first
+        {% else %}sorted by confidence{% endif %}
+      </span>
     </div>
 
     <div class="queue-tabs">
@@ -112,6 +118,10 @@
       <a class="queue-tab {{ 'active' if tab == 'staged' }}" data-tab="staged" href="?tab=staged"
          onclick="loadQueue('staged', 1); return false;">
         Staged <span class="count">{{ staged_count }}</span>
+      </a>
+      <a class="queue-tab {{ 'active' if tab == 'rejected' }}" data-tab="rejected" href="?tab=rejected"
+         onclick="loadQueue('rejected', 1); return false;">
+        Rejected <span class="count">{{ rejected_count }}</span>
       </a>
     </div>
 
@@ -133,11 +143,33 @@
       {% if matches|length == 0 %}
       <div class="empty-state">
         <div class="big">—</div>
-        <div>{{ "No staged files." if tab == 'staged' else "No matches yet." }}</div>
+        <div>
+          {% if tab == 'staged' %}No staged files.
+          {% elif tab == 'rejected' %}No rejected previews.
+          {% else %}No matches yet.{% endif %}
+        </div>
       </div>
       {% endif %}
 
-      {% if tab == 'staged' %}
+      {% if tab == 'pending' %}
+        {% for m in matches %}
+        {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
+        <a class="row" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
+          <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
+          <div class="filename">
+            <span class="label">preview</span>
+            {{ m.preview_filename }}
+          </div>
+          <div class="filename">
+            <span class="label">best match</span>
+            {{ m.candidate_filename }}
+          </div>
+          <div>
+            <div class="status-pill">pending</div>
+          </div>
+        </a>
+        {% endfor %}
+      {% else %}
         {% for m in matches %}
         <a class="row" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
           <div class="score-badge">—</div>
@@ -149,32 +181,8 @@
             <span class="label">best match</span>
             {{ m.candidate_filename or "—" }}
           </div>
-          <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
           <div>
-            <div class="status-pill staged">staged</div>
-          </div>
-        </a>
-        {% endfor %}
-      {% else %}
-        {% for m in matches %}
-        {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
-        <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
-          <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
-          <div class="filename">
-            <span class="label">preview</span>
-            {{ m.preview_filename }}
-          </div>
-          <div class="filename">
-            <span class="label">best match</span>
-            {{ m.candidate_filename }}
-          </div>
-          <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
-          <div>
-            {% if m.decision_status == 'rejected' %}
-              <div class="status-pill rejected">rejected</div>
-            {% else %}
-              <div class="status-pill">pending</div>
-            {% endif %}
+            <div class="status-pill {{ tab }}">{{ tab }}</div>
           </div>
         </a>
         {% endfor %}
@@ -230,55 +238,57 @@
       `;
     }
 
+    const EMPTY_MESSAGES = {
+      staged: 'No staged files.', rejected: 'No rejected previews.', pending: 'No matches yet.',
+    };
+
     function renderRowsHtml(d) {
       if (d.matches.length === 0) {
-        const msg = d.tab === 'staged' ? 'No staged files.' : 'No matches yet.';
-        return `<div class="empty-state"><div class="big">—</div><div>${msg}</div></div>`;
+        return `<div class="empty-state"><div class="big">—</div><div>${EMPTY_MESSAGES[d.tab]}</div></div>`;
       }
       const backRef = `tab=${d.tab}&page=${d.page}`;
-      if (d.tab === 'staged') {
+      if (d.tab !== 'pending') {
         return d.matches.map(m => `
           <a class="row" href="/review/${m.preview_id}?${backRef}">
             <div class="score-badge">—</div>
             <div class="filename"><span class="label">preview</span>${escapeHtml(m.preview_filename)}</div>
             <div class="filename"><span class="label">best match</span>${escapeHtml(m.candidate_filename || '—')}</div>
-            <div class="duration">${Math.round(m.preview_duration)}s</div>
-            <div><div class="status-pill staged">staged</div></div>
+            <div><div class="status-pill ${d.tab}">${d.tab}</div></div>
           </a>
         `).join('');
       }
-      return d.matches.map(m => {
-        const decided = m.decision_status ? 'decided' : '';
-        const pill = m.decision_status === 'rejected'
-          ? '<div class="status-pill rejected">rejected</div>'
-          : '<div class="status-pill">pending</div>';
-        return `
-          <a class="row ${decided}" href="/review/${m.preview_id}?${backRef}">
-            <div class="score-badge ${scoreClass(m.combined_score)}">${Math.round(m.combined_score * 100)}</div>
-            <div class="filename"><span class="label">preview</span>${escapeHtml(m.preview_filename)}</div>
-            <div class="filename"><span class="label">best match</span>${escapeHtml(m.candidate_filename)}</div>
-            <div class="duration">${Math.round(m.preview_duration)}s</div>
-            <div>${pill}</div>
-          </a>
-        `;
-      }).join('');
+      return d.matches.map(m => `
+        <a class="row" href="/review/${m.preview_id}?${backRef}">
+          <div class="score-badge ${scoreClass(m.combined_score)}">${Math.round(m.combined_score * 100)}</div>
+          <div class="filename"><span class="label">preview</span>${escapeHtml(m.preview_filename)}</div>
+          <div class="filename"><span class="label">best match</span>${escapeHtml(m.candidate_filename)}</div>
+          <div><div class="status-pill">pending</div></div>
+        </a>
+      `).join('');
     }
+
+    const QUEUE_TITLES = {
+      staged: d => `Staged for deletion — ${d.total_count} preview${d.total_count === 1 ? '' : 's'}`,
+      rejected: d => `Rejected — ${d.total_count} preview${d.total_count === 1 ? '' : 's'}`,
+      pending: d => `Review queue — ${d.total_count} preview${d.total_count === 1 ? '' : 's'} with a candidate match`,
+    };
+    const QUEUE_SUBS = {
+      staged: 'most recently staged first', rejected: 'most recently rejected first', pending: 'sorted by confidence',
+    };
 
     function renderQueue(d) {
       CURRENT_TAB = d.tab;
       CURRENT_PAGE = d.page;
 
-      document.getElementById('queue-title').textContent = d.tab === 'staged'
-        ? `Staged for deletion — ${d.total_count} preview${d.total_count === 1 ? '' : 's'}`
-        : `Review queue — ${d.total_count} preview${d.total_count === 1 ? '' : 's'} with a candidate match`;
-      document.getElementById('queue-sub').textContent = d.tab === 'staged'
-        ? 'most recently staged first' : 'sorted by confidence, undecided first';
+      document.getElementById('queue-title').textContent = QUEUE_TITLES[d.tab](d);
+      document.getElementById('queue-sub').textContent = QUEUE_SUBS[d.tab];
 
       document.querySelectorAll('.queue-tab').forEach(a => {
         a.classList.toggle('active', a.dataset.tab === d.tab);
       });
       document.querySelector('.queue-tab[data-tab="pending"] .count').textContent = d.pending_count;
       document.querySelector('.queue-tab[data-tab="staged"] .count').textContent = d.staged_count;
+      document.querySelector('.queue-tab[data-tab="rejected"] .count').textContent = d.rejected_count;
 
       const paginationHtml = renderPaginationHtml(d);
       document.getElementById('pagination-top').innerHTML = paginationHtml;

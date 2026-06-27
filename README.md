@@ -406,14 +406,18 @@ video comparison all reflow for a phone-width screen) — useful for
 checking on a long-running scan, or doing a quick approve/reject pass,
 from a phone without it just rendering a zoomed-out desktop page.
 
-- Queue (`/`) has two tabs: **Pending** lists every undecided-or-rejected
+- Queue (`/`) has three tabs: **Pending** lists every truly-undecided
   preview with at least one candidate match above the noise floor,
-  sorted by confidence (undecided + highest-confidence first); **Staged**
-  lists every preview currently staged for deletion, most recently staged
-  first — kept separate so you can review/undo what's about to be
-  deleted without scrolling past everything else, and (unlike Pending)
-  never affected by a later re-scan or re-match changing what it's
-  shown next to. Each tab is paginated, 40 rows per page; switching tabs
+  sorted by confidence; **Staged** lists every preview currently staged
+  for deletion, most recently staged first; **Rejected** lists every
+  preview marked "not a match / keep," most recently rejected first —
+  in case a rejection turns out to have been a mistake, you can find it
+  and hit "undo" on its review page instead of it just disappearing
+  into Pending. Staged and Rejected are both kept separate from Pending
+  so you can review/undo a past decision without scrolling past
+  everything still undecided, and (unlike Pending) neither is ever
+  affected by a later re-scan or re-match changing what it's shown next
+  to. Each tab is paginated, 40 rows per page; switching tabs
   or pages updates the list via AJAX (no full page reload), so it never
   resets your scroll position — and returning to the queue from a review
   page (via "back to queue" or right after deciding) restores the exact

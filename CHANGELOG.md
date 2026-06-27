@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-27 — 0.16.0
+
+- **Added a Rejected tab** to the review queue, alongside Pending/
+  Staged — rejecting a preview by mistake previously meant it just sank
+  to the bottom of the Pending list, mixed in with genuinely undecided
+  ones, with no dedicated way to find and reconsider it. Rejected
+  previews are now sourced directly from `decisions` (`rejected_queue_rows`
+  in `04_serve.py`, sharing a new `_decision_queue_rows` helper with
+  `staged_queue_rows`) — same reasoning as staged: independent of
+  `matches`/`missing_since`, so a rejection stays reachable and undoable
+  even if a later `03_match.py` re-score drops the pair below threshold.
+  The existing "undo" button on the review page already worked for any
+  decision status, not just staged, so no changes were needed there —
+  verified live end-to-end: rejecting, then undoing from the Rejected
+  tab, correctly returns a preview to Pending. The Pending tab itself
+  now only ever shows truly-undecided previews (it used to also include
+  rejected ones, sunk to the bottom) — Pending/Staged/Rejected are now a
+  clean three-way split with no overlap.
+- **Removed the preview's duration ("344s") from the queue list rows**
+  — per feedback, raw seconds in a list view isn't useful information
+  (duration is still shown, human-readable, on the review page's card
+  headers). Also dropped `candidate_duration`, which turned out to
+  already be selected by the queue queries but never actually rendered
+  anywhere.
+
 ## 2026-06-27 — 0.15.2
 
 - **Fix (real feedback, immediately after 0.15.1 shipped): tab/
