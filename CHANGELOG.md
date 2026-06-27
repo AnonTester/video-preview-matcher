@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-06-27 — 0.17.1
+
+- **Fix (same-day follow-up, real user feedback): the new topbar logo
+  was too small to actually read.** Two compounding causes, both fixed:
+  the CSS sized it to the brand text's line-height (~19.5px) rather
+  than the topbar's own height; and the source SVG itself had a lot of
+  internal padding — its artwork only filled about half of the original
+  `viewBox="0 0 680 480"` canvas. Cropped `static/logo.svg`'s `viewBox`
+  to its actual visible content (`163 113 368 254`, plus a small margin)
+  and updated its root `width`/`height` to match that aspect ratio
+  (`200 138`, was a square `200 200`) — a file-level fix, so it applies
+  to all three consumers of this one file (favicon, Android manifest
+  icon, topbar `<img>`) without touching any of them individually.
+  `.brand-logo`'s height went 18px → 44px, and `.topbar`'s vertical
+  padding was tightened (14px → 8px, desktop and mobile both) so the
+  logo — not unused padding — now defines most of the topbar's height.
+  Verified by rendering `logo.svg` standalone (the same way a favicon
+  would see it) and confirming the artwork fills its own intrinsic box
+  edge-to-edge, not just by checking the topbar's CSS-scaled rendering.
+
+## 2026-06-27 — 0.17.0
+
+- **Added a logo** (`static/logo.svg`) — favicon on both pages, Android
+  "add to home screen" icon via a new `static/manifest.webmanifest`
+  (`display: standalone`, dark `theme_color`/`background_color`
+  matching the app's own dark theme), and inline in the queue page's
+  topbar, to the left of "Preview Matcher" with a small gap. The
+  logo+title is now one clickable link back to `/`. Removed the
+  "· review console" text from the title. Sized to the brand text's
+  own line-height rather than the topbar's full padded height —
+  confirmed via a real render (including a 4x-device-scale screenshot
+  to check legibility at the actual display size) that the topbar's
+  height is unchanged from before. `review.html` picks up the favicon/
+  manifest too, but not the inline logo — its topbar shows "video #id",
+  not the app title, so there's nothing to put it next to there.
+
 ## 2026-06-27 — 0.16.1
 
 - **Raised `--min-scene-duration`'s default from 2.0s to 5.0s** —

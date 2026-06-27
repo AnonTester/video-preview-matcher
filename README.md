@@ -418,9 +418,13 @@ your hardware.
 The layout is responsive (queue rows, scan panel, and the side-by-side
 video comparison all reflow for a phone-width screen) — useful for
 checking on a long-running scan, or doing a quick approve/reject pass,
-from a phone without it just rendering a zoomed-out desktop page.
+from a phone without it just rendering a zoomed-out desktop page. The
+favicon doubles as the "add to home screen" icon on Android (via
+`static/manifest.webmanifest`), so a shortcut on the home screen opens
+without browser chrome, like an app.
 
-- Queue (`/`) has three tabs: **Pending** lists every truly-undecided
+- Queue (`/`) shows the logo and "Preview Matcher" title as one
+  clickable link back to `/`, and has three tabs: **Pending** lists every truly-undecided
   preview with at least one candidate match above the noise floor,
   sorted by confidence; **Staged** lists every preview currently staged
   for deletion, most recently staged first; **Rejected** lists every
@@ -548,7 +552,10 @@ preview-matcher/
 ├── templates/
 │   ├── index.html         Review queue
 │   └── review.html        Side-by-side comparison page
-├── static/style.css
+├── static/
+│   ├── style.css
+│   ├── logo.svg           Favicon + Android home-screen icon + topbar logo
+│   └── manifest.webmanifest
 ├── tests/
 │   ├── render_templates_test.py
 │   ├── staging_logic_test.py

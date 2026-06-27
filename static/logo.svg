@@ -1,0 +1,15 @@
+<svg width="200" height="138" viewBox="163 113 368 254" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>MatchVid logo</title>
+  <desc>Three-layer logo: solid black blue-frame shape behind, white frame in middle, semi-transparent blue frame on top</desc>
+
+  <rect x="280" y="190" width="220" height="160" rx="14" fill="#0d0f12"/>
+
+  <rect x="180" y="130" width="220" height="160" rx="14" fill="#0d0f12" stroke="#d8dce1" stroke-width="4"/>
+  <polygon points="260,178 260,242 325,210" fill="#d8dce1"/>
+
+  <rect x="280" y="190" width="220" height="160" rx="14" fill="#0d0f12" fill-opacity="0.45" stroke="#5b8def" stroke-width="4"/>
+  <polygon points="360,238 360,302 425,270" fill="#5b8def"/>
+
+  <circle cx="480" cy="194" r="36" fill="#5b8def"/>
+  <path d="M462,194 L474,206 L500,180" fill="none" stroke="#0d0f12" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

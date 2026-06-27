@@ -5,11 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Preview Matcher — Review Queue</title>
   <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+  <link rel="icon" type="image/svg+xml" href="/static/logo.svg?v={{ app_version }}">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <meta name="theme-color" content="#0d0f12">
 </head>
 <body>
 
   <div class="topbar">
-    <div class="brand"><b>Preview Matcher</b> <span class="version">v{{ app_version }}</span> · review console</div>
+    <a class="brand-link" href="/">
+      <img class="brand-logo" src="/static/logo.svg?v={{ app_version }}" alt="">
+      <div class="brand"><b>Preview Matcher</b> <span class="version">v{{ app_version }}</span></div>
+    </a>
     <div class="stats">
       <span>videos <span class="stat-val">{{ stats.total_videos }}</span></span>
       <span>fingerprinted <span class="stat-val">{{ stats.fingerprinted_videos }}</span></span>

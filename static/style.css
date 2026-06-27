@@ -46,12 +46,45 @@ a { color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 24px;
+  /* Vertical padding deliberately tighter than the standard 14px here
+     — the logo is sized to fill most of the topbar's own height (see
+     .brand-logo below), so the "small margin" around it should come
+     from this padding, not from the logo being small relative to a
+     tall, loosely-padded bar. */
+  padding: 8px 24px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-raised);
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+.brand-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  text-decoration: none;
+}
+
+.brand-link:hover .brand {
+  color: var(--text);
+}
+
+.brand-logo {
+  /* Sized to roughly fill the topbar's height minus the small margin
+     .topbar's own padding now provides — found via real user feedback
+     that matching the brand *text's* line-height (~19.5px) made the
+     logo too small to read; the source SVG's viewBox was also cropped
+     to its actual visible content (it had a lot of internal whitespace
+     — the shapes only filled about half of the original 680x480
+     canvas), so this height isn't being spent on padding baked into
+     the file itself anymore either. Width is intentionally auto: the
+     root width/height attributes now match the cropped viewBox's own
+     aspect ratio, so the browser derives the correct (non-square,
+     non-letterboxed) width directly from the image. */
+  height: 44px;
+  width: auto;
+  display: block;
 }
 
 .topbar .brand {
@@ -842,7 +875,7 @@ kbd {
   .topbar {
     flex-wrap: wrap;
     gap: 8px;
-    padding: 12px 14px;
+    padding: 8px 14px;
   }
 
   .stats {
