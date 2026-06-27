@@ -221,6 +221,7 @@ def test_score_pair_perfect_visual_match_no_audio():
     assert res["combined_score"] == 1.0  # no audio -> combined == visual, no penalty
     assert len(res["scene_matches"]) == 3
     assert res["match_spread_sec"] == 2.0  # preview_ts 1.0..3.0
+    assert res["distinct_candidate_match_count"] == 3
     print("test_score_pair_perfect_visual_match_no_audio: OK")
 
 
@@ -245,6 +246,7 @@ def test_score_pair_clustered_matches_have_small_spread():
     res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert len(res["scene_matches"]) == 3
     assert res["match_spread_sec"] == 1.6  # 1.8 - 0.2
+    assert res["distinct_candidate_match_count"] == 3
     print("test_score_pair_clustered_matches_have_small_spread: OK")
 
 
@@ -267,6 +269,7 @@ def test_score_pair_repeated_intro_has_zero_candidate_spread():
     assert len(res["scene_matches"]) == 3
     assert res["match_spread_sec"] == 99.0, res["match_spread_sec"]
     assert res["candidate_match_spread_sec"] == 0.0, res["candidate_match_spread_sec"]
+    assert res["distinct_candidate_match_count"] == 1
     print("test_score_pair_repeated_intro_has_zero_candidate_spread: OK")
 
 
@@ -290,7 +293,40 @@ def test_score_pair_independent_matches_have_spread_on_both_sides():
     res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     assert res["match_spread_sec"] == 99.0, res["match_spread_sec"]
     assert res["candidate_match_spread_sec"] == 390.0, res["candidate_match_spread_sec"]
+    assert res["distinct_candidate_match_count"] == 3
     print("test_score_pair_independent_matches_have_spread_on_both_sides: OK")
+
+
+def test_score_pair_distinct_candidate_match_count_collapses_duplicates():
+    # video #936: 6 preview scenes (a repeated camera-flash frame) all
+    # best-match the *identical* candidate scene, plus one unrelated,
+    # genuinely coincidental match elsewhere. That 7th match alone gives
+    # candidate_match_spread_sec a huge value (hundreds of seconds) even
+    # though 6 of the 7 "matches" are really one match counted six
+    # times — distinct_candidate_match_count must see through that and
+    # report 2, not 7, so --min-matched-scenes (checked against this,
+    # not the raw count) correctly rejects a pair with only 2 real
+    # pieces of evidence.
+    scenes_by_video = {
+        1: _video_scenes([
+            (16.4, "ff00ff00ff00ff00", None),
+            (35.2, "ff00ff00ff00ff00", None),
+            (40.6, "ff00ff00ff00ff00", None),
+            (73.0, "ff00ff00ff00ff00", None),
+            (78.9, "ff00ff00ff00ff00", None),
+            (138.3, "ff00ff00ff00ff00", None),
+            (533.1, "00ff00ff00ff00ff", None),
+        ]),
+        2: _video_scenes([
+            (75.68, "ff00ff00ff00ff00", None),
+            (717.6, "00ff00ff00ff00ff", None),
+        ]),
+    }
+    res = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
+    assert len(res["scene_matches"]) == 7
+    assert res["candidate_match_spread_sec"] == 717.6 - 75.68, res["candidate_match_spread_sec"]
+    assert res["distinct_candidate_match_count"] == 2, res["distinct_candidate_match_count"]
+    print("test_score_pair_distinct_candidate_match_count_collapses_duplicates: OK")
 
 
 def test_chunk_pairs_empty_list():
@@ -478,6 +514,7 @@ if __name__ == "__main__":
     test_score_pair_clustered_matches_have_small_spread()
     test_score_pair_repeated_intro_has_zero_candidate_spread()
     test_score_pair_independent_matches_have_spread_on_both_sides()
+    test_score_pair_distinct_candidate_match_count_collapses_duplicates()
     test_trim_worker_memory_does_not_raise()
     test_score_chunk_result_unaffected_by_memory_trim()
     test_record_candidate_keeps_only_top_n_per_preview()

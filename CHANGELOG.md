@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-27 — 0.16.1
+
+- **Raised `--min-scene-duration`'s default from 2.0s to 5.0s** —
+  real review kept surfacing short flash/strobe-ish cuts that still
+  slipped through the old floor.
+- **Fix (real false positive, found via real review — video #936): a
+  sixth false-positive class, and a real gap in the candidate-side
+  spread check from 0.14.1, not a separate mechanism.** 6 preview
+  scenes (a repeated camera-flash frame, mostly blown-out white) all
+  best-matched the *identical* candidate timestamp, but one additional,
+  genuinely unrelated coincidental match elsewhere in the candidate was
+  on its own enough to clear `--min-candidate-match-spread` — spread
+  (max − min) is blind to *repetition* of a value, since duplicates
+  never move the min or the max. The preview and candidate were
+  completely different videos. Fixed by computing
+  `distinct_candidate_match_count` in `score_pair()` (matched scenes
+  deduplicated by exact `candidate_ts` equality) and checking
+  `--min-matched-scenes` against that instead of the raw matched-scene
+  count — exactly what the flag was always meant to guard against; it
+  just hadn't been built to see through duplicate-by-repetition before.
+  `candidate_match_spread_sec` itself needed no change.
+- Re-ran `03_match.py` against the real library after deploying both
+  fixes: confirmed video #936 no longer has a stored match; total
+  stored matches dropped 169 -> 144.
+
 ## 2026-06-27 — 0.16.0
 
 - **Added a Rejected tab** to the review queue, alongside Pending/

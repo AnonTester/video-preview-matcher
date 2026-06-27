@@ -250,26 +250,32 @@ calibrated values. Expect to spend real time here:
   previews can be a larger fraction of the source than 95%, widen this.
 
 - **`--min-matched-scenes`** (`03_match.py`, default `3`): a match is only
-  stored if at least this many scenes matched, *in addition to* clearing
-  `--min-visual-score`'s fraction. Added because a preview with very few
-  total scenes (e.g. 2) only needs *one* coincidental match to clear a
-  fraction-only threshold (1/2 = 50%) — exactly what happened with three
-  real false positives in this library, each a single isolated match at
-  the hash-threshold boundary on a 2-6-scene preview. A real preview
+  stored if at least this many *distinct candidate scenes* matched, *in
+  addition to* clearing `--min-visual-score`'s fraction — not the raw
+  count of matched preview scenes; several preview scenes matching the
+  identical candidate scene collapse into one piece of evidence (see
+  the `--min-candidate-match-spread` entry below for the real false
+  positive — video #936 — that found this distinction mattered, not
+  just in theory). Added because a preview with very few total scenes
+  (e.g. 2) only needs *one* coincidental match to clear a fraction-only
+  threshold (1/2 = 50%) — exactly what happened with three real false
+  positives in this library, each a single isolated match at the
+  hash-threshold boundary on a 2-6-scene preview. A real preview
   splices together several moments from its source; one matching scene
   is weak, easily-coincidental evidence on its own, not confirmation.
 
-- **`--min-scene-duration`** (`03_match.py`, default `2.0` seconds): drops
+- **`--min-scene-duration`** (`03_match.py`, default `5.0` seconds): drops
   any scene whose gap to the next scene-cut in its own video is shorter
   than this, before scoring. Added after a real false positive (review
   video #2237): a shared intro/logo animation got chopped by scene
   detection into several quick cuts, all of which matched and cleared
   `--min-matched-scenes` (3/3) — but they were all the same ~4-second
   sting, not independent evidence. A scene this short isn't an
-  independently identifiable moment either way. 2.0s is a starting
-  point, not calibrated — raise it if real rapid-cut footage keeps
-  slipping through, lower it if legitimate short scenes are being
-  dropped.
+  independently identifiable moment either way. Raised from an initial
+  `2.0` after real review kept surfacing short flash/strobe-ish cuts
+  that still slipped through at that floor — raise it further if
+  rapid-cut footage keeps slipping through, lower it if legitimate
+  short scenes are being dropped.
 
 - **`--min-match-spread`** (`03_match.py`, default `2.0` seconds): skips
   storing a match if its matched scenes' *preview* timestamps span less
@@ -288,6 +294,14 @@ calibrated values. Expect to spend real time here:
   wasn't a match at all; `--min-match-spread` alone can't see that,
   since it never looks at the candidate side. Both spread checks must
   pass — corroboration needs independence on both sides, not just one.
+  **This alone wasn't enough**, found via a second real false positive
+  (review video #936): 6 preview scenes (a repeated camera-flash frame)
+  all matched the *identical* candidate timestamp, but one *additional*,
+  genuinely unrelated coincidental match elsewhere in the candidate was
+  on its own enough to clear this spread check — spread (max − min) is
+  blind to *repetition* of the same value, since duplicates never move
+  the min or the max. Fixed in `--min-matched-scenes` itself (see
+  above), not here — this check's own spread math needed no change.
 
 - **Audio scoring** (`chromaprint_similarity` in `03_match.py`): shipped
   as a deliberately simple bit-overlap comparator, explicitly flagged in

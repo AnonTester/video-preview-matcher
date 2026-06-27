@@ -37,7 +37,12 @@ MINIMUM MATCHED-SCENE COUNT (--min-matched-scenes, default 3):
     --hash-threshold 12 -> 8 (all three false positives sat exactly at the
     old boundary) and --min-matched-scenes added at 3.
 
-MINIMUM SCENE DURATION (--min-scene-duration, default 2.0s) AND MATCH
+    Checked against the count of *distinct* candidate scenes among the
+    matches, not the raw count of matched preview scenes — see DISTINCT
+    CANDIDATE MATCHES below for why that distinction turned out to
+    matter for real, not just in theory.
+
+MINIMUM SCENE DURATION (--min-scene-duration, default 5.0s) AND MATCH
 SPREAD (--min-match-spread, default 2.0s):
     A second, distinct false-positive class found via real review (video
     #2237): a preview and an unrelated candidate both opened with the same
@@ -55,14 +60,18 @@ SPREAD (--min-match-spread, default 2.0s):
     way. Applied once in load_all_scenes() to both sides of every pair
     (a video can be someone else's candidate), not per-pair. A scene with
     no next cut (the last one in its video) has no known duration and is
-    always kept rather than guessed at.
+    always kept rather than guessed at. Raised 2.0s -> 5.0s after real
+    review kept surfacing short flash/strobe-ish cuts (around a second
+    or two) that still slipped through at the old floor — not calibrated
+    against a specific incident the way the other defaults below are,
+    just real-world experience that 2.0s wasn't a high enough bar.
     --min-match-spread independently requires the matched scenes'
     *preview* timestamps to span at least this many seconds — guards
     against scenes that individually pass the duration floor but still
     all land within the same narrow moment (e.g. a longer single shared
-    title card). Both are starting points (2.0s), not calibrated values —
-    tune with real false positives/negatives in hand, same as
-    --hash-threshold's history above.
+    title card). Starting points, not calibrated values — tune with real
+    false positives/negatives in hand, same as --hash-threshold's
+    history above.
 
 CANDIDATE-SIDE MATCH SPREAD (--min-candidate-match-spread, default 2.0s):
     A third false-positive class, found via real review (video #4059):
@@ -86,6 +95,36 @@ CANDIDATE-SIDE MATCH SPREAD (--min-candidate-match-spread, default 2.0s):
     Both spread checks must pass; either axis alone is insufficient,
     since a real match needs corroboration that's independent on *both*
     sides, not just one.
+
+DISTINCT CANDIDATE MATCHES (folded into --min-matched-scenes, above):
+    A fourth false-positive class, found via real review (video #936)
+    — and a real gap in the CANDIDATE-SIDE MATCH SPREAD fix right above,
+    not a separate mechanism: 6 different preview scenes (a repeated
+    camera-flash frame — mostly blown-out white) all best-matched the
+    *identical* candidate_ts, because the candidate happened to have one
+    similarly blown-out-white scene. A 7th, unrelated, genuinely
+    coincidental match elsewhere in the candidate was — on its own —
+    enough to clear --min-candidate-match-spread (max ts - min ts across
+    *all* matches was still hundreds of seconds), even though 6 of the 7
+    "matches" were really one match counted six times. Spread (max -
+    min) is blind to *repetition* of the same value by construction —
+    duplicates never change which values are the min and the max, only
+    how many matches there nominally are. The previews and candidate
+    were, per direct review, completely different videos. Fixed by
+    computing distinct_candidate_match_count in score_pair() — matched
+    scenes deduplicated by exact candidate_ts equality (reliable here:
+    a duplicate only ever arises from two preview scenes resolving to
+    the literal same best-matching candidate scene index in
+    score_scenes(), never from independently-close-but-different
+    timestamps) — and checking --min-matched-scenes against *that*
+    instead of the raw matched-scene count. This is exactly what
+    --min-matched-scenes was always meant to guard against; it just
+    hadn't been built to see through duplicate-by-repetition before.
+    candidate_match_spread_sec itself needed no change: duplicate values
+    never move a min/max, so it was already correctly describing the
+    *true* spread among distinct candidate points all along — the bug
+    was purely in what --min-matched-scenes counted, not in the spread
+    calculation.
 
 AUDIO SCORE:
     Chromaprint fingerprints are compared only when both sides have one
@@ -307,7 +346,7 @@ Usage:
                              [--color-threshold 0.25] [--min-ratio 0.02]
                              [--max-ratio 0.95] [--top-n 5]
                              [--min-visual-score 0.15] [--min-matched-scenes 3]
-                             [--min-scene-duration 2.0] [--min-match-spread 2.0]
+                             [--min-scene-duration 5.0] [--min-match-spread 2.0]
                              [--min-candidate-match-spread 2.0]
                              [--workers N]
 """
@@ -540,6 +579,22 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
         if len(matched) > 1 else 0.0
     )
 
+    # Number of *distinct* candidate scenes among the matches — see
+    # module docstring's DISTINCT CANDIDATE MATCHES section. Several
+    # preview scenes can all best-match the identical candidate_ts (a
+    # repeated flash frame matching one blown-out-white candidate
+    # moment, found via video #936); a single unrelated coincidental
+    # match elsewhere can then single-handedly clear
+    # candidate_match_spread_sec even though most of the "evidence" is
+    # really one match counted several times. --min-matched-scenes is
+    # checked against this, not raw len(matched), so duplicates collapse
+    # to the one piece of evidence they actually are. Exact float
+    # equality is reliable for grouping here: a duplicate candidate_ts
+    # only ever arises from two preview scenes resolving to the literal
+    # same best-matching candidate scene index in score_scenes(), not
+    # from independently-close-but-different timestamps.
+    distinct_candidate_match_count = len({m["candidate_ts"] for m in matched})
+
     # Audio score (only if both sides have a usable fingerprint)
     audio_score = None
     p_audio = audio_by_video.get(preview_id)
@@ -559,6 +614,7 @@ def score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, hash_t
         "scene_matches": matched,
         "match_spread_sec": match_spread_sec,
         "candidate_match_spread_sec": candidate_match_spread_sec,
+        "distinct_candidate_match_count": distinct_candidate_match_count,
     }
 
 
@@ -817,9 +873,11 @@ def main():
     ap.add_argument("--top-n", type=int, default=5, help="store top N candidate matches per preview")
     ap.add_argument("--min-visual-score", type=float, default=0.15, help="skip storing matches below this visual score (noise floor)")
     ap.add_argument("--min-matched-scenes", type=int, default=3,
-                     help="skip storing matches with fewer than this many matched scenes — a high *fraction* "
-                          "from a tiny sample (e.g. 1/2) is weak, coincidental evidence; see module docstring")
-    ap.add_argument("--min-scene-duration", type=float, default=2.0,
+                     help="skip storing matches with fewer than this many *distinct* candidate scenes matched "
+                          "— a high *fraction* from a tiny sample (e.g. 1/2) is weak, coincidental evidence, "
+                          "and several preview scenes matching the identical candidate scene are one piece of "
+                          "evidence, not several; see module docstring")
+    ap.add_argument("--min-scene-duration", type=float, default=5.0,
                      help="drop scenes shorter than this (seconds, gap to the next scene-cut in their own "
                           "video) before scoring — a rapid-cut intro/logo sting isn't an independently "
                           "identifiable scene; see module docstring's MINIMUM SCENE DURATION section")
@@ -941,7 +999,7 @@ def main():
         for i, (preview_id, candidate_id) in enumerate(pairs, 1):
             res = score_pair(scenes_by_video, audio_by_video, preview_id, candidate_id, args.hash_threshold, args.color_threshold)
             if (res and res["visual_score"] >= args.min_visual_score
-                    and len(res["scene_matches"]) >= args.min_matched_scenes
+                    and res["distinct_candidate_match_count"] >= args.min_matched_scenes
                     and res["match_spread_sec"] >= args.min_match_spread
                     and res["candidate_match_spread_sec"] >= args.min_candidate_match_spread):
                 _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
@@ -980,7 +1038,7 @@ def main():
                 for fut in as_completed(futures):
                     for preview_id, candidate_id, res in fut.result():
                         if (res and res["visual_score"] >= args.min_visual_score
-                                and len(res["scene_matches"]) >= args.min_matched_scenes
+                                and res["distinct_candidate_match_count"] >= args.min_matched_scenes
                                 and res["match_spread_sec"] >= args.min_match_spread
                                 and res["candidate_match_spread_sec"] >= args.min_candidate_match_spread):
                             _record_candidate(results_by_preview, preview_id, candidate_id, res, args.top_n)
