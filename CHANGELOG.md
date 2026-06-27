@@ -1,5 +1,104 @@
 # Changelog
 
+## 2026-06-27 — 0.15.2
+
+- **Fix (real feedback, immediately after 0.15.1 shipped): tab/
+  pagination clicks still moved the scroll position — 0.15.1's "jump to
+  just below the topbar" was an improvement on jumping to the absolute
+  page top, but still not what was wanted.** Switching tabs/pages swaps
+  the row list in place via AJAX; nothing above or around it changes,
+  so there's no reason to move scroll at all. Removed
+  `scrollQueueIntoView()`'s call entirely — `loadQueue` no longer
+  touches scroll position in any way (it's still naturally clamped if
+  the new tab/page has less content than the current scroll offset,
+  which is unavoidable, not a bug).
+- **Fix (real bug, same feedback): the scroll position restored after
+  returning from a review page drifted a little lower each time,
+  compounding on repeated round trips.** Root cause: the restore ran on
+  `window.addEventListener('load', ...)`, but `refreshStaging()`/
+  `refreshMissing()`/`loadScanRoots()`/the first `pollScanStatus()` are
+  independent fetches that can resolve *after* `load` and change page
+  height above the queue (e.g. the staging-bar becoming visible).
+  Restoring before they'd settled set the right scrollY for the page's
+  *current*, not-yet-final height; when one of them then inserted
+  content above, Chrome's scroll anchoring nudged scrollY again to keep
+  the same pixels in view — landing a bit lower than originally saved.
+  That drifted position then got re-saved as "correct" on the next
+  `pagehide`, compounding further on every subsequent round trip.
+  Fixed by waiting for all four of those calls to settle
+  (`Promise.allSettled`, not `Promise.all` — one failed fetch must not
+  block the others from letting the restore happen) before restoring,
+  instead of just waiting for `load`. Verified live: tab and bottom-
+  pagination clicks now leave `scrollY` provably unchanged, and the
+  review round-trip restores the *exact* scroll offset across two
+  repeated trips in a row (no drift at all, not just a smaller one).
+
+## 2026-06-27 — 0.15.1
+
+- **Fix (real bug, found via user report on mobile, immediately after
+  0.15.0 shipped): pagination/tabs were still doing a full page
+  reload, not AJAX.** `loadQueue` is an `async function`; the tab/
+  pagination links called it as `onclick="return loadQueue(...)"` —
+  but that makes the handler's *synchronous* return value the Promise
+  `loadQueue` returns immediately, which is truthy, not the literal
+  `false` needed to cancel the link's default navigation. The browser
+  always followed the `href` regardless, while `loadQueue` raced
+  pointlessly in the background. 0.15.0's own verification missed this
+  because it called `loadQueue(...)` directly via `Runtime.evaluate`,
+  never dispatching a real click through the actual `<a>` element —
+  exercising the function, not the bug. Fixed by changing every
+  occurrence to `onclick="loadQueue(...); return false;"` (fire the
+  async call, then synchronously return the literal `false` the click
+  handler actually needs). Re-verified this time with real
+  `element.click()` dispatch, not direct function calls.
+- **Fix (real bug, same report): switching tabs/pages jumped the
+  scroll all the way to the absolute top of the page** (above the
+  topbar/staging-bar/scan-panel), not just to the top of the queue
+  list — a much bigger, more disorienting jump on mobile, where that's
+  a lot of vertical space to re-scroll past on every click. Was a
+  literal `window.scrollTo(0, 0)`. Replaced with `scrollQueueIntoView()`,
+  which scrolls so `.queue-header`'s top lands just below the sticky
+  topbar's *actual* rendered height (read live via
+  `getBoundingClientRect()`, not a hardcoded pixel guess — correct
+  whether the topbar is single-line on desktop or wraps taller on
+  mobile).
+- Re-verified the full flow (AJAX tab switch, AJAX pagination, and
+  returning from a review page) end-to-end at a real mobile viewport
+  size (375×812) with real click dispatch this time, not just the
+  desktop-sized, direct-function-call check 0.15.0 shipped with.
+
+## 2026-06-27 — 0.15.0
+
+- **Queue tabs/pagination now use AJAX instead of full page navigation.**
+  Every tab switch or page click was a full reload, which reset scroll
+  position every time — annoying when paging through a long list. Added
+  `GET /api/queue?tab=&page=` (backed by the same `_queue_page_data()`
+  the HTML route already used) and client-side JS (`loadQueue`/
+  `renderQueue` in index.html) that re-renders the title, tabs, both
+  pagination blocks, and the row list in place, using `history.pushState`
+  to keep the URL in sync without a reload. Browser back/forward between
+  these AJAX-loaded states is handled via a `popstate` listener — no
+  reload there either. `history.scrollRestoration = 'manual'` is set
+  explicitly so the browser's own scroll-restoration heuristics never
+  fight this.
+- **Scroll position is now restored when returning to the queue from a
+  review page — both via "back to queue" and after staging/keeping/
+  dismissing.** Saved to `sessionStorage` on `pagehide` (fires on any
+  navigation away, including the real, full-page navigation to
+  `/review/{id}` and back), restored on the queue page's `load` event.
+  Found via live testing (a real, reproducible failure, not assumed):
+  restoring synchronously in the inline script — *before* `load` — did
+  move `scrollY`, but the browser's own "reset scroll to top for a new
+  navigation" behavior ran afterward and silently undid it every time;
+  deferring the restore to `load` (after that reset has already
+  happened) fixes it. Verified against a real headless-browser session
+  driving the actual AJAX tab/pagination flow end-to-end (scripted over
+  raw DevTools Protocol via a small stdlib-only WebSocket client, no new
+  dependency) — confirmed AJAX tab switches update the title/active-tab/
+  URL/row-count/scroll-to-top correctly, browser back/forward between
+  them works without a reload, and the realistic "scroll down → open a
+  review page → return" flow restores the exact scroll offset.
+
 ## 2026-06-26 — 0.14.3
 
 - **Fix (real cleanup gap, found via direct user question before it

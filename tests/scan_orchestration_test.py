@@ -282,6 +282,46 @@ def test_staged_queue_rows_orders_most_recently_staged_first():
     print("test_staged_queue_rows_orders_most_recently_staged_first: OK")
 
 
+def test_queue_page_data_pending_tab():
+    """_queue_page_data is what both index() (HTML) and /api/queue
+    (JSON, used by the queue page's AJAX tab/pagination switching — see
+    index.html's loadQueue()) build their response from — must stay in
+    sync with queue_rows()/staged_queue_rows()'s own counts."""
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        _seed_video(conn, 3)
+        _seed_decision(conn, 3, "staged")
+        data = serve_mod._queue_page_data(conn, "pending", 1)
+    assert data["tab"] == "pending"
+    assert data["page"] == 1
+    assert data["total_count"] == 1
+    assert data["pending_count"] == 1
+    assert data["staged_count"] == 1
+    assert data["total_pages"] == 1
+    assert [m["preview_id"] for m in data["matches"]] == [1]
+    print("test_queue_page_data_pending_tab: OK")
+
+
+def test_queue_page_data_staged_tab():
+    reset()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)
+        _seed_video(conn, 2)
+        _seed_match(conn, 1, 2, 0.9)
+        _seed_video(conn, 3)
+        _seed_decision(conn, 3, "staged")
+        data = serve_mod._queue_page_data(conn, "staged", 1)
+    assert data["tab"] == "staged"
+    assert data["total_count"] == 1
+    assert data["pending_count"] == 1
+    assert data["staged_count"] == 1
+    assert [m["preview_id"] for m in data["matches"]] == [3]
+    print("test_queue_page_data_staged_tab: OK")
+
+
 def test_build_cmd_inventory_includes_roots_and_limit():
     cmd = serve_mod._build_cmd("01_inventory.py", 7, "/data/library.db", {"roots": ["/a", "/b"], "limit": 50})
     assert "/a" in cmd and "/b" in cmd
@@ -796,6 +836,8 @@ if __name__ == "__main__":
     test_purge_staging_files_deletes_staged_files_and_flips_decisions()
     test_purge_staging_files_deletes_orphaned_remux_cache_entries_for_staged_videos()
     test_purge_staging_files_leaves_other_remux_cache_entries_alone()
+    test_queue_page_data_pending_tab()
+    test_queue_page_data_staged_tab()
     test_build_cmd_inventory_includes_roots_and_limit()
     test_build_cmd_includes_debug_log_for_inventory_and_fingerprint()
     test_build_cmd_inventory_omits_limit_when_not_set()

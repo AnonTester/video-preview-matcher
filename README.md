@@ -413,7 +413,11 @@ from a phone without it just rendering a zoomed-out desktop page.
   first — kept separate so you can review/undo what's about to be
   deleted without scrolling past everything else, and (unlike Pending)
   never affected by a later re-scan or re-match changing what it's
-  shown next to. Each tab is paginated, 40 rows per page. A preview or
+  shown next to. Each tab is paginated, 40 rows per page; switching tabs
+  or pages updates the list via AJAX (no full page reload), so it never
+  resets your scroll position — and returning to the queue from a review
+  page (via "back to queue" or right after deciding) restores the exact
+  scroll offset you had before. A preview or
   candidate flagged missing (see "Keeping the database in sync with the
   library" above) is hidden from Pending — a "missing files" panel next
   to the staging-folder controls lists them and lets you prune the DB

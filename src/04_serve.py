@@ -326,18 +326,46 @@ def staged_queue_rows(conn, page: int = 1, page_size: int = PAGE_SIZE) -> tuple[
     return [dict(r) for r in rows], total
 
 
+def _queue_page_data(conn, tab: str, page: int) -> dict:
+    """Shared between index() (full page, server-rendered) and
+    /api/queue (JSON, used by the queue page's own JS to switch tabs/
+    pages without a full reload — see index.html's loadQueue(). A full
+    reload would reset scroll position every time, which is the whole
+    reason this exists as its own function instead of being inlined
+    into index() like before."""
+    if tab == "staged":
+        matches, total = staged_queue_rows(conn, page)
+        pending_count, staged_count = _pending_total(conn), total
+    else:
+        matches, total = queue_rows(conn, page)
+        pending_count, staged_count = total, _staged_total(conn)
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    return {
+        "matches": matches,
+        "tab": tab,
+        "page": page,
+        "total_pages": total_pages,
+        "total_count": total,
+        "pending_count": pending_count,
+        "staged_count": staged_count,
+    }
+
+
+@app.get("/api/queue")
+def api_queue(tab: str = "pending", page: int = 1):
+    tab = tab if tab in ("pending", "staged") else "pending"
+    page = max(1, page)
+    with connect(STATE["db_path"]) as conn:
+        return _queue_page_data(conn, tab, page)
+
+
 @app.get("/")
 def index(request: Request, tab: str = "pending", page: int = 1):
     tab = tab if tab in ("pending", "staged") else "pending"
     page = max(1, page)
 
     with connect(STATE["db_path"]) as conn:
-        if tab == "staged":
-            matches, total = staged_queue_rows(conn, page)
-            pending_count, staged_count = _pending_total(conn), total
-        else:
-            matches, total = queue_rows(conn, page)
-            pending_count, staged_count = total, _staged_total(conn)
+        data = _queue_page_data(conn, tab, page)
 
         stats = conn.execute(
             """
@@ -351,18 +379,10 @@ def index(request: Request, tab: str = "pending", page: int = 1):
             """
         ).fetchone()
 
-    total_pages = max(1, math.ceil(total / PAGE_SIZE))
-
     return templates.TemplateResponse(request, "index.html", {
-        "matches": matches,
+        **data,
         "stats": dict(stats),
         "app_version": APP_VERSION,
-        "tab": tab,
-        "page": page,
-        "total_pages": total_pages,
-        "total_count": total,
-        "pending_count": pending_count,
-        "staged_count": staged_count,
     })
 
 

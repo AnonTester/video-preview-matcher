@@ -94,21 +94,23 @@
 
   <div class="queue">
     <div class="queue-header">
-      <h1>
+      <h1 id="queue-title">
         {% if tab == 'staged' %}
           Staged for deletion — {{ total_count }} preview{{ "" if total_count == 1 else "s" }}
         {% else %}
           Review queue — {{ total_count }} preview{{ "" if total_count == 1 else "s" }} with a candidate match
         {% endif %}
       </h1>
-      <span class="sub">{{ "most recently staged first" if tab == 'staged' else "sorted by confidence, undecided first" }}</span>
+      <span class="sub" id="queue-sub">{{ "most recently staged first" if tab == 'staged' else "sorted by confidence, undecided first" }}</span>
     </div>
 
     <div class="queue-tabs">
-      <a class="queue-tab {{ 'active' if tab == 'pending' }}" href="?tab=pending">
+      <a class="queue-tab {{ 'active' if tab == 'pending' }}" data-tab="pending" href="?tab=pending"
+         onclick="loadQueue('pending', 1); return false;">
         Pending <span class="count">{{ pending_count }}</span>
       </a>
-      <a class="queue-tab {{ 'active' if tab == 'staged' }}" href="?tab=staged">
+      <a class="queue-tab {{ 'active' if tab == 'staged' }}" data-tab="staged" href="?tab=staged"
+         onclick="loadQueue('staged', 1); return false;">
         Staged <span class="count">{{ staged_count }}</span>
       </a>
     </div>
@@ -116,69 +118,235 @@
     {% macro pagination_controls() %}
       {% if total_pages > 1 %}
       <div class="pagination">
-        <a class="page-link {{ 'disabled' if page <= 1 }}" href="?tab={{ tab }}&page={{ page - 1 }}">&laquo; prev</a>
+        <a class="page-link {{ 'disabled' if page <= 1 }}" href="?tab={{ tab }}&page={{ page - 1 }}"
+           onclick="loadQueue('{{ tab }}', {{ page - 1 }}); return false;">&laquo; prev</a>
         <span class="page-info">page {{ page }} of {{ total_pages }}</span>
-        <a class="page-link {{ 'disabled' if page >= total_pages }}" href="?tab={{ tab }}&page={{ page + 1 }}">next &raquo;</a>
+        <a class="page-link {{ 'disabled' if page >= total_pages }}" href="?tab={{ tab }}&page={{ page + 1 }}"
+           onclick="loadQueue('{{ tab }}', {{ page + 1 }}); return false;">next &raquo;</a>
       </div>
       {% endif %}
     {% endmacro %}
 
-    {{ pagination_controls() }}
+    <div id="pagination-top">{{ pagination_controls() }}</div>
 
-    {% if matches|length == 0 %}
-    <div class="empty-state">
-      <div class="big">—</div>
-      <div>{{ "No staged files." if tab == 'staged' else "No matches yet." }}</div>
+    <div id="queue-rows">
+      {% if matches|length == 0 %}
+      <div class="empty-state">
+        <div class="big">—</div>
+        <div>{{ "No staged files." if tab == 'staged' else "No matches yet." }}</div>
+      </div>
+      {% endif %}
+
+      {% if tab == 'staged' %}
+        {% for m in matches %}
+        <a class="row" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
+          <div class="score-badge">—</div>
+          <div class="filename">
+            <span class="label">preview</span>
+            {{ m.preview_filename }}
+          </div>
+          <div class="filename">
+            <span class="label">best match</span>
+            {{ m.candidate_filename or "—" }}
+          </div>
+          <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
+          <div>
+            <div class="status-pill staged">staged</div>
+          </div>
+        </a>
+        {% endfor %}
+      {% else %}
+        {% for m in matches %}
+        {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
+        <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
+          <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
+          <div class="filename">
+            <span class="label">preview</span>
+            {{ m.preview_filename }}
+          </div>
+          <div class="filename">
+            <span class="label">best match</span>
+            {{ m.candidate_filename }}
+          </div>
+          <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
+          <div>
+            {% if m.decision_status == 'rejected' %}
+              <div class="status-pill rejected">rejected</div>
+            {% else %}
+              <div class="status-pill">pending</div>
+            {% endif %}
+          </div>
+        </a>
+        {% endfor %}
+      {% endif %}
     </div>
-    {% endif %}
 
-    {% if tab == 'staged' %}
-      {% for m in matches %}
-      <a class="row" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
-        <div class="score-badge">—</div>
-        <div class="filename">
-          <span class="label">preview</span>
-          {{ m.preview_filename }}
-        </div>
-        <div class="filename">
-          <span class="label">best match</span>
-          {{ m.candidate_filename or "—" }}
-        </div>
-        <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
-        <div>
-          <div class="status-pill staged">staged</div>
-        </div>
-      </a>
-      {% endfor %}
-    {% else %}
-      {% for m in matches %}
-      {% set score_class = 'high' if m.combined_score >= 0.75 else ('mid' if m.combined_score >= 0.4 else 'low') %}
-      <a class="row {% if m.decision_status %}decided{% endif %}" href="/review/{{ m.preview_id }}?tab={{ tab }}&page={{ page }}">
-        <div class="score-badge {{ score_class }}">{{ "%.0f"|format(m.combined_score * 100) }}</div>
-        <div class="filename">
-          <span class="label">preview</span>
-          {{ m.preview_filename }}
-        </div>
-        <div class="filename">
-          <span class="label">best match</span>
-          {{ m.candidate_filename }}
-        </div>
-        <div class="duration">{{ "%.0f"|format(m.preview_duration) }}s</div>
-        <div>
-          {% if m.decision_status == 'rejected' %}
-            <div class="status-pill rejected">rejected</div>
-          {% else %}
-            <div class="status-pill">pending</div>
-          {% endif %}
-        </div>
-      </a>
-      {% endfor %}
-    {% endif %}
-
-    {{ pagination_controls() }}
+    <div id="pagination-bottom">{{ pagination_controls() }}</div>
   </div>
 
   <script>
+    // ---------------------------------------------------------------------
+    // Queue tabs/pagination via AJAX, not full page navigation — a full
+    // reload reset scroll position on every single tab/page click, which
+    // is annoying when paging through a long list. /api/queue returns
+    // exactly what index() would've rendered server-side (see
+    // _queue_page_data in 04_serve.py, shared by both); this just
+    // re-renders the same markup client-side instead of reloading.
+    // ---------------------------------------------------------------------
+
+    let CURRENT_TAB = {{ tab|tojson }};
+    let CURRENT_PAGE = {{ page }};
+
+    // Disables the browser's own scroll-restoration heuristics for
+    // history traversal on this page, so it never fights the manual
+    // restore logic below (relevant once popstate below makes browser
+    // back/forward navigate between AJAX-loaded tab/page states, not
+    // just full page loads).
+    if ('scrollRestoration' in history) {
+      history.scrollRestoration = 'manual';
+    }
+    history.replaceState({tab: CURRENT_TAB, page: CURRENT_PAGE}, '', window.location.href);
+
+    function escapeHtml(s) {
+      const div = document.createElement('div');
+      div.textContent = s == null ? '' : s;
+      return div.innerHTML;
+    }
+
+    function scoreClass(score) {
+      return score >= 0.75 ? 'high' : (score >= 0.4 ? 'mid' : 'low');
+    }
+
+    function renderPaginationHtml(d) {
+      if (d.total_pages <= 1) return '';
+      const prevDisabled = d.page <= 1 ? 'disabled' : '';
+      const nextDisabled = d.page >= d.total_pages ? 'disabled' : '';
+      return `
+        <div class="pagination">
+          <a class="page-link ${prevDisabled}" href="?tab=${d.tab}&page=${d.page - 1}" onclick="loadQueue('${d.tab}', ${d.page - 1}); return false;">&laquo; prev</a>
+          <span class="page-info">page ${d.page} of ${d.total_pages}</span>
+          <a class="page-link ${nextDisabled}" href="?tab=${d.tab}&page=${d.page + 1}" onclick="loadQueue('${d.tab}', ${d.page + 1}); return false;">next &raquo;</a>
+        </div>
+      `;
+    }
+
+    function renderRowsHtml(d) {
+      if (d.matches.length === 0) {
+        const msg = d.tab === 'staged' ? 'No staged files.' : 'No matches yet.';
+        return `<div class="empty-state"><div class="big">—</div><div>${msg}</div></div>`;
+      }
+      const backRef = `tab=${d.tab}&page=${d.page}`;
+      if (d.tab === 'staged') {
+        return d.matches.map(m => `
+          <a class="row" href="/review/${m.preview_id}?${backRef}">
+            <div class="score-badge">—</div>
+            <div class="filename"><span class="label">preview</span>${escapeHtml(m.preview_filename)}</div>
+            <div class="filename"><span class="label">best match</span>${escapeHtml(m.candidate_filename || '—')}</div>
+            <div class="duration">${Math.round(m.preview_duration)}s</div>
+            <div><div class="status-pill staged">staged</div></div>
+          </a>
+        `).join('');
+      }
+      return d.matches.map(m => {
+        const decided = m.decision_status ? 'decided' : '';
+        const pill = m.decision_status === 'rejected'
+          ? '<div class="status-pill rejected">rejected</div>'
+          : '<div class="status-pill">pending</div>';
+        return `
+          <a class="row ${decided}" href="/review/${m.preview_id}?${backRef}">
+            <div class="score-badge ${scoreClass(m.combined_score)}">${Math.round(m.combined_score * 100)}</div>
+            <div class="filename"><span class="label">preview</span>${escapeHtml(m.preview_filename)}</div>
+            <div class="filename"><span class="label">best match</span>${escapeHtml(m.candidate_filename)}</div>
+            <div class="duration">${Math.round(m.preview_duration)}s</div>
+            <div>${pill}</div>
+          </a>
+        `;
+      }).join('');
+    }
+
+    function renderQueue(d) {
+      CURRENT_TAB = d.tab;
+      CURRENT_PAGE = d.page;
+
+      document.getElementById('queue-title').textContent = d.tab === 'staged'
+        ? `Staged for deletion — ${d.total_count} preview${d.total_count === 1 ? '' : 's'}`
+        : `Review queue — ${d.total_count} preview${d.total_count === 1 ? '' : 's'} with a candidate match`;
+      document.getElementById('queue-sub').textContent = d.tab === 'staged'
+        ? 'most recently staged first' : 'sorted by confidence, undecided first';
+
+      document.querySelectorAll('.queue-tab').forEach(a => {
+        a.classList.toggle('active', a.dataset.tab === d.tab);
+      });
+      document.querySelector('.queue-tab[data-tab="pending"] .count').textContent = d.pending_count;
+      document.querySelector('.queue-tab[data-tab="staged"] .count').textContent = d.staged_count;
+
+      const paginationHtml = renderPaginationHtml(d);
+      document.getElementById('pagination-top').innerHTML = paginationHtml;
+      document.getElementById('pagination-bottom').innerHTML = paginationHtml;
+      document.getElementById('queue-rows').innerHTML = renderRowsHtml(d);
+    }
+
+    // No scroll manipulation here at all, deliberately — switching tabs
+    // or pages swaps the row list in place via AJAX; nothing above or
+    // around it moves, so the scroll position the user already has is
+    // already correct and shouldn't be touched. An earlier version
+    // jumped to the top of the queue section on every click — not what
+    // was wanted even though it was an improvement on jumping to the
+    // absolute page top; the actual right answer is to not move the
+    // scroll position at all.
+    async function loadQueue(tab, page, push = true) {
+      const r = await fetch(`/api/queue?tab=${tab}&page=${page}`);
+      if (!r.ok) return false;
+      const d = await r.json();
+      renderQueue(d);
+      if (push) {
+        history.pushState({tab: d.tab, page: d.page}, '', `?tab=${d.tab}&page=${d.page}`);
+      }
+      return false;
+    }
+
+    window.addEventListener('popstate', (event) => {
+      const state = event.state || {tab: 'pending', page: 1};
+      loadQueue(state.tab, state.page, false);
+    });
+
+    // Scroll position restoration: landing back on "/" after clicking
+    // "back to queue" on a review page, or after staging/keeping/
+    // dismissing there, is a fresh page load (different page, not a
+    // true browser back-navigation), so there's no scroll position for
+    // the browser to remember on its own. review.html threads tab/page
+    // back through so the same content reloads here; this restores the
+    // scroll offset on top of that, saved just before navigating away.
+    //
+    // The restore has to wait until *after* every async call below that
+    // can change page height above the queue (refreshStaging/
+    // refreshMissing's bars, loadScanRoots' checkbox list, the first
+    // pollScanStatus render) has actually resolved — not just window
+    // 'load' (page resources, unrelated to these fetches). Restoring
+    // too early — confirmed live, the actual cause of a real reported
+    // bug — sets scrollY correctly for the page's *current* (not yet
+    // settled) height; when one of those fetches resolves moments later
+    // and inserts/changes content above the queue, Chrome's scroll
+    // anchoring then nudges scrollY again to keep the same pixels in
+    // view, landing a little lower than the originally saved position.
+    // That extra bit gets re-saved as the "real" position on the next
+    // pagehide, so repeating the round trip compounds it further down
+    // each time — exactly the "shifts down bit by bit" symptom reported.
+    // Waiting for all of them via Promise.allSettled (not Promise.all —
+    // one failed fetch must not block the others from letting the
+    // restore happen) means nothing is left to shift afterward.
+    const SCROLL_KEY = 'queueScrollY';
+    window.addEventListener('pagehide', () => {
+      sessionStorage.setItem(SCROLL_KEY, String(window.scrollY));
+    });
+    function restoreScrollPosition() {
+      const savedScrollY = sessionStorage.getItem(SCROLL_KEY);
+      if (savedScrollY != null) {
+        sessionStorage.removeItem(SCROLL_KEY);
+        window.scrollTo(0, parseInt(savedScrollY, 10));
+      }
+    }
+
     async function refreshStaging() {
       const r = await fetch('/api/staging-summary');
       const d = await r.json();
@@ -211,7 +379,7 @@
       alert(`Deleted ${j.deleted} file(s).`);
       refreshStaging();
     }
-    refreshStaging();
+    const initialStagingPromise = refreshStaging();
 
     // ---------------------------------------------------------------------
     // Missing files (deleted/moved/renamed outside this tool — see
@@ -258,7 +426,7 @@
       alert(`Removed ${j.deleted} record(s).`);
       refreshMissing();
     }
-    refreshMissing();
+    const initialMissingPromise = refreshMissing();
 
     // ---------------------------------------------------------------------
     // Library scan controls
@@ -525,9 +693,18 @@
       workersDirty = true;
     });
     updateScanControlsVisibility();
-    loadScanRoots();
-    pollScanStatus();
+    const initialScanRootsPromise = loadScanRoots();
+    const initialScanStatusPromise = pollScanStatus();
     setInterval(pollScanStatus, 2000);
+
+    // Every async call above that can change page height above/around
+    // the queue must settle before scroll gets restored — see
+    // restoreScrollPosition's own comment for why. allSettled (not all)
+    // so one failed fetch can't block the rest from letting it happen.
+    Promise.allSettled([
+      initialStagingPromise, initialMissingPromise,
+      initialScanRootsPromise, initialScanStatusPromise,
+    ]).then(restoreScrollPosition);
 
     // Browsers throttle setInterval timers in backgrounded/hidden tabs
     // (sometimes down to once a minute or less) — without this, a scan
