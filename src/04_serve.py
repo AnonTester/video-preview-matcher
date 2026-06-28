@@ -174,7 +174,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Preview Matcher Review", lifespan=lifespan)
+app = FastAPI(title="Video Preview Matcher Review", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(PROJECT_ROOT / "templates"))
 

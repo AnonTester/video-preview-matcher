@@ -184,11 +184,15 @@ on a single core):
 
     There's no I/O or shared resource contention in this stage (no
     ffmpeg, no NFS, no GPU) unlike 02_fingerprint.py, so unlike that
-    stage's worker-count tuning, more cores should mostly just help here.
-    Exactly how much, and whether leaving a core free (the default) vs.
-    using every core matters in practice, hasn't been benchmarked for
-    real on production hardware yet — do that before assuming the
-    default is optimal; see README's "Tuning" section.
+    stage's worker-count tuning, more cores mostly help *speed*-wise —
+    but under --executor loky (the default), each worker also carries
+    its own private memory cost that scales with worker count, unlike
+    --executor fork. --workers now defaults to a fixed 8, not an
+    auto-detected cpu_count-1, picked from a real worker-count-vs-memory
+    matrix (4/8/16 workers, see BENCHMARKS.md): 8 was the actual sweet
+    spot — 16 raised the memory ceiling ~35% for no speed benefit, 4
+    saved little memory but cost ~72% more time. See TUNING.md before
+    assuming this transfers to a very different library size or host.
 
     COST-AWARE CHUNKING: `_chunk_pairs`'s `cost_fn` parameter balances
     each chunk's *estimated total cost* (scene-count product), not just
@@ -340,6 +344,90 @@ and restoring full sharing — see `--pool-generation-chunks`'s own help
 text for why this avoids `--max-tasks-per-child`'s deadlock (it goes
 through `_launch_processes()`, only reachable when no manager thread is
 alive, instead of `_adjust_process_count()`, which forks while one is).
+Tested live against the real ~5000-video library
+(`--pool-generation-chunks 300`): made the memory *peak* worse (~10.7GB
+vs ~8GB with no pool generations at all), not better under
+`--executor fork` — left at its default (0, disabled) there pending
+further investigation; see BENCHMARKS.md.
+
+`--executor loky` (third-party `pip install loky`, see BENCHMARKS.md for
+the full writeup) tests a different lever: launch workers via
+`fork()`-then-`exec()` instead of plain `fork()`, which is what makes
+periodic recycling deadlock-safe in the first place (no inherited
+threads/locks survive the `exec()`), at the cost of giving up
+copy-on-write sharing of the preloaded scene/audio data entirely — each
+worker deserializes its own private copy from the start. Two real loky
+bugs had to be worked around to make this usable at all: a module-level
+`ctypes.CDLL` global (`_get_libc()`, used by `--trim-worker-memory`)
+crashed every loky run outright until it was made lazy (cloudpickle
+can't pickle a live CDLL handle); and `_WORKER_STATE` had to move from a
+bare module global to `_worker_state()` (routed through `sys.modules`)
+because of a confirmed, open upstream bug
+(https://github.com/joblib/loky/issues/359) where cloudpickle gives
+every separately-submitted task its own disconnected globals snapshot,
+making an initializer-set global invisible to later calls. Tested live
+against the real ~6000-video library, `--workers 8`: with no forced
+recycling, memory climbed steadily past 9.4GB before an external safety
+abort (not a crash) at 77% progress, no better than `fork` — removing
+copy-on-write divergence didn't help, because nothing was shared to
+diverge from in the first place, and whatever else drives the climb
+(see above — still not fully explained) was unaffected. *With*
+`--pool-generation-chunks 50` added, the run **completed** (879.6s, vs
+`fork`'s documented ~12min — ~22% slower) with memory oscillating
+~1.7-2.55GB the entire time instead of ever climbing — roughly a 4.4x
+lower peak than `fork`'s documented ~11.2GB. This is the first attempt
+in this whole investigation that actually worked, on the metric that
+was asked for (bounded memory, not speed) — but only the recycling
+half of the combination did the work; dropping `fork` alone did not.
+
+**Promoted to the default, not left opt-in, on explicit instruction:
+bounded memory matters more than speed for this stage — a slower run
+that finishes safely beats a fast one that risks taking the host
+down.** `--executor` now defaults to `loky`, and `--pool-generation-
+chunks` defaults to 50 under it (still 0, i.e. disabled, under
+`--executor fork` — the now-explicitly-opt-in "raw" path, where
+recycling measured *worse*, see above). `--executor fork` remains
+available for anyone who wants the old stdlib-only behavior back
+(e.g. to avoid the `loky` dependency entirely) — its memory use is
+*not* bounded by anything else in this script.
+
+**A second, independent safety net** for both executors:
+`--min-available-ram-percent` (default 8%) checks real system memory
+(`psutil.virtual_memory()`, the same AVAILABLE-not-FREE distinction
+every live investigation above actually watched) after every completed
+chunk, and aborts — no matches written, existing data untouched, same
+safety property as any other interruption — the moment available RAM
+drops below it. `_force_kill_pool()` terminates every worker process
+directly rather than waiting for in-flight chunks to drain (loky's own
+`shutdown(kill_workers=True)`, or a direct `kill()` of each
+`ProcessPoolExecutor` child under `--executor fork`) — see its own
+docstring. This exists specifically so a still-unbounded combination —
+whether that's deliberately-chosen `--executor fork`, or some future
+`--workers`/`--pool-generation-chunks`/library-size combination under
+`--executor loky` that isn't actually bounded the way the one tested
+combination was — fails safely instead of taking the whole host down.
+Only verified by forcing an immediate trip (an unreachable threshold
+against a small seeded DB, both executors, both confirming a clean
+exit and zero rows written) — never by actually exhausting host memory
+for real, by design.
+
+**Same-day follow-up: full worker-count and recycling-interval matrix
+against the real library, under --executor loky, replacing the
+single-data-point defaults above with ones actually picked from a
+comparison.** `--workers`: 4/8/16, all at `--pool-generation-chunks 50`
+— 8 was the real sweet spot (879.6s, ~2.55GB peak); 16 raised the
+memory ceiling ~35% (~3.46GB) for no speed benefit (916.8s, marginally
+*slower*); 4 saved little memory (~2.09GB) but cost ~72% more time
+(1510.9s). `--workers` now defaults to a fixed 8, not an auto-detected
+`cpu_count - 1`. `--pool-generation-chunks`: 20/50/100, all at
+`--workers 8` — memory stayed bounded across all three (~2.40GB,
+~2.55GB, ~2.74GB respectively, a ~14% spread), while 100 ran ~35%
+faster than 20 (766.0s vs 1187.1s). Picked 100 as the new default: the
+memory cost of the faster option is small next to the ~9.4GB+
+unbounded/aborted no-recycling case or `--executor fork`'s documented
+~11.2GB, so there's little reason to pay extra time for a difference
+this size once already this far inside a safe range. See BENCHMARKS.md
+for the full matrix.
 
 Usage:
     python3 src/03_match.py --db data/library.db [--hash-threshold 8]
@@ -359,11 +447,18 @@ import json
 import os
 import sys
 import time
+import types
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import psutil
+
+try:
+    from loky import get_reusable_executor as _loky_get_reusable_executor
+except ImportError:
+    _loky_get_reusable_executor = None
 
 sys.path.insert(0, str(Path(__file__).parent))
 from db import connect, init_db, update_scan_run
@@ -736,15 +831,60 @@ def _chunk_pairs(pairs: list, workers: int, cost_fn=None, progress_interval_sec:
     return chunks
 
 
-# Populated once per worker process by _init_worker — see module docstring's
-# PERFORMANCE section for why this is an initializer (run once per worker)
-# rather than data passed with every task.
-_WORKER_STATE: dict = {}
+_WORKER_STATE_MODULE_NAME = "_03_match_worker_state"
 
-try:
-    _LIBC = ctypes.CDLL("libc.so.6")
-except OSError:
-    _LIBC = None  # non-glibc platform (e.g. macOS dev box) — trimming becomes a no-op
+
+def _worker_state() -> dict:
+    """The one true per-worker-process state dict — populated once by
+    _init_worker, read by every _score_chunk call in that same worker.
+    Deliberately *not* a plain module-level global: --executor loky's
+    default job reducer (cloudpickle) serializes __main__-defined
+    functions *by value*, which gives every separately-pool.submit()'d
+    call to _score_chunk its own fresh, disconnected __globals__
+    snapshot — a bare `_WORKER_STATE` name written by _init_worker (a
+    *different* pickled-by-value call) is invisible to it, even within
+    the same worker process. Confirmed live, and a known, open upstream
+    bug (https://github.com/joblib/loky/issues/359), not a mistake in
+    how this was wired up. `sys.modules`, unlike a function's own
+    __globals__, is a real dict that's genuinely the same object across
+    every call in one process, regardless of which "module" any given
+    reconstructed function believes it belongs to — confirmed live this
+    fixes it. Stashing a real ModuleType under a private key (rather
+    than writing straight into sys.modules) avoids surprising anything
+    else that walks sys.modules expecting module-like objects.
+    --executor fork hits this same function too — harmless, just a
+    dict lookup, no different in cost from the old bare global."""
+    mod = sys.modules.get(_WORKER_STATE_MODULE_NAME)
+    if mod is None:
+        mod = sys.modules[_WORKER_STATE_MODULE_NAME] = types.ModuleType(_WORKER_STATE_MODULE_NAME)
+        mod.state = {}
+    return mod.state
+
+
+_LIBC = None
+_LIBC_LOAD_ATTEMPTED = False
+
+
+def _get_libc():
+    """Lazily load libc, on first use inside whichever process calls this
+    — never at module-import time. A module-level `ctypes.CDLL(...)`
+    global broke --executor loky outright: loky's job reducer
+    (cloudpickle) serializes __main__-defined functions *by value*,
+    which walks the module's globals — including this one — and a live
+    CDLL handle can't be pickled (confirmed live: AttributeError deep in
+    Python 3.13's restructured _ctypes internals, not a clean
+    "unpicklable" error). Deferring the CDLL() call to first real use
+    means it only ever happens inside an already-running worker process,
+    never crossing a pickle boundary; --executor fork is unaffected
+    either way (fork never pickles worker setup at all)."""
+    global _LIBC, _LIBC_LOAD_ATTEMPTED
+    if not _LIBC_LOAD_ATTEMPTED:
+        _LIBC_LOAD_ATTEMPTED = True
+        try:
+            _LIBC = ctypes.CDLL("libc.so.6")
+        except OSError:
+            _LIBC = None  # non-glibc platform (e.g. macOS dev box) — trimming becomes a no-op
+    return _LIBC
 
 
 def _trim_worker_memory():
@@ -760,21 +900,23 @@ def _trim_worker_memory():
     `gc.collect()` first gives CPython's own small-object allocator
     (pymalloc) its best chance to release any now-empty arenas back to
     glibc before asking glibc to release them to the OS. No-op on
-    non-glibc platforms (`_LIBC` is None there)."""
+    non-glibc platforms (`_get_libc()` returns None there)."""
     gc.collect()
-    if _LIBC is not None:
-        _LIBC.malloc_trim(0)
+    libc = _get_libc()
+    if libc is not None:
+        libc.malloc_trim(0)
 
 
 def _init_worker(scenes_by_video, audio_by_video, hash_threshold, color_threshold, trim_memory=False, debug_memory=False):
-    _WORKER_STATE["scenes"] = scenes_by_video
-    _WORKER_STATE["audio"] = audio_by_video
-    _WORKER_STATE["hash_threshold"] = hash_threshold
-    _WORKER_STATE["color_threshold"] = color_threshold
-    _WORKER_STATE["trim_memory"] = trim_memory
-    _WORKER_STATE["debug_memory"] = debug_memory
-    _WORKER_STATE["chunks_done"] = 0
-    _WORKER_STATE["pairs_done"] = 0
+    state = _worker_state()
+    state["scenes"] = scenes_by_video
+    state["audio"] = audio_by_video
+    state["hash_threshold"] = hash_threshold
+    state["color_threshold"] = color_threshold
+    state["trim_memory"] = trim_memory
+    state["debug_memory"] = debug_memory
+    state["chunks_done"] = 0
+    state["pairs_done"] = 0
 
 
 def _score_chunk(pairs_chunk: list) -> list:
@@ -784,17 +926,18 @@ def _score_chunk(pairs_chunk: list) -> list:
     sequential path, so both code paths apply identical thresholds.
     Trims the worker's heap before returning — see _trim_worker_memory's
     docstring; cheap relative to a chunk's actual scoring work."""
-    scenes = _WORKER_STATE["scenes"]
-    audio = _WORKER_STATE["audio"]
-    hash_threshold = _WORKER_STATE["hash_threshold"]
-    color_threshold = _WORKER_STATE["color_threshold"]
+    state = _worker_state()
+    scenes = state["scenes"]
+    audio = state["audio"]
+    hash_threshold = state["hash_threshold"]
+    color_threshold = state["color_threshold"]
     result = [
         (preview_id, candidate_id, score_pair(scenes, audio, preview_id, candidate_id, hash_threshold, color_threshold))
         for preview_id, candidate_id in pairs_chunk
     ]
-    if _WORKER_STATE.get("trim_memory"):
+    if state.get("trim_memory"):
         _trim_worker_memory()
-    if _WORKER_STATE.get("debug_memory"):
+    if state.get("debug_memory"):
         _log_worker_memory_debug(len(pairs_chunk))
     return result
 
@@ -815,9 +958,10 @@ def _log_worker_memory_debug(chunk_pairs: int) -> None:
     space fragmented between still-live objects)."""
     import resource
 
-    _WORKER_STATE["chunks_done"] += 1
-    _WORKER_STATE["pairs_done"] += chunk_pairs
-    n = _WORKER_STATE["chunks_done"]
+    state = _worker_state()
+    state["chunks_done"] += 1
+    state["pairs_done"] += chunk_pairs
+    n = state["chunks_done"]
     if n % 10 != 0 and n > 3:
         return
     objs = gc.get_objects()
@@ -827,7 +971,7 @@ def _log_worker_memory_debug(chunk_pairs: int) -> None:
         counts[t] = counts.get(t, 0) + 1
     top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:6]
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    print(f"[debug-memory pid={os.getpid()}] chunks={n} pairs={_WORKER_STATE['pairs_done']} "
+    print(f"[debug-memory pid={os.getpid()}] chunks={n} pairs={state['pairs_done']} "
           f"maxrss_kb={rss_kb} total_gc_objects={len(objs)} top_types={top}", flush=True)
 
 
@@ -863,6 +1007,101 @@ def _record_candidate(top_candidates: dict, preview_id: int, candidate_id: int, 
         heapq.heapreplace(heap, entry)
 
 
+def _make_pool(args, scenes_by_video, audio_by_video):
+    """Construct this generation's worker pool — see module docstring's
+    MEMORY GROWTH section for why there are two distinct executors. Both
+    branches pass the *same* initargs tuple — _init_worker doesn't know
+    or care which executor invoked it.
+
+    Callers always use this inside a `with ... as pool:` block, one per
+    generation. That matters for --executor loky specifically: every
+    generation's `with` block calls `pool.shutdown(wait=True)` on exit,
+    which sets the reusable singleton's own `_flags.shutdown`. The next
+    generation's get_reusable_executor() call always rebuilds from
+    scratch when that flag is set — true *regardless* of the `reuse`
+    kwarg's value (see reusable_executor.py's get_reusable_executor: the
+    `executor._flags.shutdown` check is OR'd ahead of the reuse check) —
+    so passing the default "auto" here is correct, not an oversight; the
+    forced-fresh-pool-per-generation guarantee comes from this function
+    always being called inside a `with` block, the same safe "fully
+    join, then construct fresh" sequencing the --executor fork path gets
+    from its own per-generation `with ProcessPoolExecutor(...) as pool:`."""
+    initargs = (scenes_by_video, audio_by_video, args.hash_threshold, args.color_threshold,
+                args.trim_worker_memory, args.debug_memory_objects)
+    if args.executor == "loky":
+        return _loky_get_reusable_executor(
+            max_workers=args.workers, initializer=_init_worker, initargs=initargs,
+        )
+    return ProcessPoolExecutor(
+        max_workers=args.workers, initializer=_init_worker, initargs=initargs,
+        max_tasks_per_child=(args.max_tasks_per_child or None),
+    )
+
+
+def _available_ram_percent() -> float:
+    """Fraction (0-100) of total system RAM currently available — not
+    just free: includes reclaimable page cache, the same distinction
+    `free -m`'s AVAILABLE column makes and the one every live memory
+    investigation in this file's history has actually watched — raw
+    FREE alone looks dangerously low on a healthy, well-cached system
+    long before anything is actually at risk."""
+    vm = psutil.virtual_memory()
+    return 100.0 * vm.available / vm.total
+
+
+def _force_kill_pool(pool, executor: str) -> None:
+    """Forcefully terminates every worker process in `pool` without
+    waiting for in-flight chunks to finish — called only after
+    --min-available-ram-percent has already tripped, where waiting even
+    a few seconds for a graceful drain risks the exact OOM this exists
+    to prevent. Under --executor loky, shutdown(kill_workers=True) is
+    loky's own documented mechanism for this (it walks its worker list
+    and calls kill_process_tree() on each — a real SIGKILL, not just
+    "stop waiting") — this is the same primitive that makes loky's
+    worker replacement deadlock-free in the first place, not a new
+    mechanism invented here. ProcessPoolExecutor
+    (--executor fork) has no public equivalent, so this reaches into
+    its internal _processes dict (pid -> Process) directly — relying on
+    an undocumented internal deliberately, the same tradeoff
+    04_serve.py's _all_descendant_pids already makes for the same
+    reason: a safety abort is exactly the case where "no public API for
+    this" shouldn't mean "can't do it"."""
+    if executor == "loky":
+        pool.shutdown(wait=True, kill_workers=True)
+        return
+    for p in list(getattr(pool, "_processes", {}).values()):
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _check_and_handle_low_memory(args, pool=None) -> bool:
+    """True if the run should stop now — checked after every chunk
+    (parallel path) or every --progress-interval-ish batch (sequential
+    path), see --min-available-ram-percent's help text. The printed
+    message is not just diagnostic: 04_serve.py's scan orchestrator
+    surfaces a failed stage's last stdout lines as the scan_runs row's
+    user-visible `message` (it overwrites whatever update_scan_run()
+    itself last wrote), so this print is the actual
+    explanation a human sees in the review UI's scan panel. Force-kills
+    `pool` (if given) *before* returning, so the caller's own `with`
+    block's shutdown runs against already-dead workers instead of
+    waiting on them."""
+    pct = _available_ram_percent()
+    if pct >= args.min_available_ram_percent:
+        return False
+    message = (f"ABORTED: available RAM dropped to {pct:.1f}% of total "
+               f"(< --min-available-ram-percent {args.min_available_ram_percent:.1f}%) — "
+               f"stopping now to avoid an OOM. No matches were written; existing data is untouched.")
+    print(message, flush=True)
+    update_scan_run(args.db, args.run_id, message=message, updated_at=time.time())
+    if pool is not None:
+        _force_kill_pool(pool, args.executor)
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=os.environ.get("DB_PATH", "data/library.db"), help="SQLite DB path (env: DB_PATH)")
@@ -890,11 +1129,17 @@ def main():
                           "many seconds — several preview-side hits that all best-match the *same* candidate "
                           "moment aren't independent corroboration either, even if they're well spread out "
                           "in the preview; see module docstring's CANDIDATE-SIDE MATCH SPREAD section")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
+    ap.add_argument("--workers", type=int, default=8,
                      help="parallel scoring processes (pure CPU-bound, no I/O contention — unlike "
-                          "02_fingerprint.py's --workers, more cores should mostly just help here, but "
-                          "this hasn't been benchmarked for real yet; see README's Tuning section). "
-                          "1 = sequential, no process pool. Default: cpu count - 1")
+                          "02_fingerprint.py's --workers, more cores mostly help *speed*-wise here, but "
+                          "under --executor loky (the default) each worker also carries its own private "
+                          "memory cost that scales with worker count, unlike --executor fork). Fixed at 8, "
+                          "not auto-detected from cpu_count, picked from a real worker-count-vs-memory "
+                          "matrix against the real ~6000-video library (4/8/16 workers, --pool-generation-"
+                          "chunks 50): 8 was the actual sweet spot — 16 raised the memory ceiling ~35% for "
+                          "no speed benefit, 4 saved little memory but cost ~72%% more time. 1 = sequential, "
+                          "no process pool. See BENCHMARKS.md for the full matrix and TUNING.md before "
+                          "assuming this transfers to a very different library size or host")
     ap.add_argument("--progress-interval", type=float, default=10.0,
                      help="--workers > 1 only: target seconds of work per chunk, so progress updates "
                           "land roughly this often instead of the chunk count being fixed regardless "
@@ -927,9 +1172,12 @@ def main():
                           "total keeps climbing — ruling out a Python-level leak *and* per-process growth "
                           "of any kind, pointing at copy-on-write divergence instead (see "
                           "--pool-generation-chunks). Left available for re-validating that fix")
-    ap.add_argument("--pool-generation-chunks", type=int, default=0,
+    ap.add_argument("--pool-generation-chunks", type=int, default=None,
                      help="--workers > 1 only: fully shut down and recreate the worker pool after this "
-                          "many chunks (0 = one pool for the whole run, the default/old behavior). "
+                          "many chunks. Defaults to 100 under --executor loky (the tested, now-default "
+                          "combination — see BENCHMARKS.md) and 0 (one pool for the whole run) under "
+                          "--executor fork, where recycling measured *worse*, not better — pass this "
+                          "explicitly to override either default. "
                           "Targets COW page-divergence memory growth that neither --max-tasks-per-child "
                           "(deadlocks) nor --trim-worker-memory (proven ineffective) could address — "
                           "confirmed live via --debug-memory-objects that no single process's own RSS "
@@ -941,14 +1189,69 @@ def main():
                           "fully joins the old pool, including its management thread, via "
                           "shutdown(wait=True) before constructing a new one — going through "
                           "ProcessPoolExecutor's initial-launch code path instead of its dynamic-worker- "
-                          "replacement one. UNTESTED IN PRODUCTION as of this flag's introduction — try "
-                          "something like 20x your --workers count as a starting point")
+                          "replacement one. Applies under --executor loky too (forces a fresh "
+                          "get_reusable_executor() there the same way). Tested live against the real "
+                          "library under --executor fork (--pool-generation-chunks 300): made the memory "
+                          "peak *worse* (~10.7GB vs ~8GB with no pool generations), not better — leave at 0 "
+                          "there. Under --executor loky, --workers 8, a full worker-count-vs-recycling "
+                          "matrix (20/50/100 chunks) found memory bounded ~2.4-2.74GB across all three — a "
+                          "small, inconsequential spread next to the ~9.4GB+ unbounded/aborted no-recycling "
+                          "case or fork's documented ~11.2GB — while 100 ran ~35%% faster than 20 (766s vs "
+                          "1187s); picked 100 as the default since the memory cost of the faster option is "
+                          "negligible at this scale. See module docstring and BENCHMARKS.md for the full "
+                          "matrix before assuming any of this transfers to the other executor")
+    ap.add_argument("--executor", choices=("fork", "loky"), default="loky",
+                     help="--workers > 1 only: which process-pool implementation backs scoring. Default: "
+                          "'loky' (third-party, pip install loky — already in requirements.txt), paired "
+                          "with --pool-generation-chunks defaulting to 100 — the combination confirmed live "
+                          "against the real library to keep memory bounded (~2.4-2.74GB across the tested "
+                          "20/50/100-chunk range) for a full run instead of climbing past 9.4GB-11.2GB+ "
+                          "uncontrolled, at a real but modest runtime cost; see "
+                          "BENCHMARKS.md. loky launches workers via fork()-then-immediately-exec() instead of "
+                          "plain fork()-and-keep-running, which sidesteps the --max-tasks-per-child deadlock "
+                          "by construction (no inherited threads/locks survive the exec) and is what makes "
+                          "--pool-generation-chunks recycling safe — but it also means workers no longer "
+                          "inherit the preloaded scene/audio data via copy-on-write; each one receives it "
+                          "freshly over pickled IPC instead, paid once per worker (re)spawn. 'fork' (today's "
+                          "stdlib ProcessPoolExecutor, the old default/'raw' behavior) is still available — "
+                          "pass it explicitly if you want the old behavior back, e.g. to avoid the loky "
+                          "dependency entirely — but its memory use is *not* bounded by anything in this "
+                          "script (--min-available-ram-percent is the only thing protecting it from an OOM "
+                          "on a long enough/large enough run). loky's own automatic per-worker memory-leak "
+                          "detection (psutil-gated, RSS-based) is also live throughout but not expected to "
+                          "ever fire here, since --debug-memory-objects already showed individual worker RSS "
+                          "stays flat in this workload; see module docstring before trusting this either way")
+    ap.add_argument("--min-available-ram-percent", type=float, default=8.0,
+                     help="--workers > 1 only: abort the run (no matches written, existing data untouched — "
+                          "same safety property as a normal interruption) if available system RAM drops "
+                          "below this percentage of total, checked after every completed chunk. Applies "
+                          "regardless of --executor — a backstop for the 'raw' --executor fork path (whose "
+                          "memory use this script otherwise does nothing to bound) and a safety net under "
+                          "--executor loky too, in case some future combination of --workers/"
+                          "--pool-generation-chunks/library size isn't actually bounded the way the tested "
+                          "combination was. On trip, kills every worker process directly (loky's "
+                          "shutdown(kill_workers=True), or a direct kill() of each ProcessPoolExecutor "
+                          "child under --executor fork) rather than waiting for in-flight chunks to drain — "
+                          "see _force_kill_pool's docstring. Default (8%%) is a starting point, not "
+                          "calibrated against a real low-memory incident the way --hash-threshold's history "
+                          "was; tune it down only with real evidence this is firing on a host that actually "
+                          "had room to spare")
     ap.add_argument("--run-id", type=int, default=None,
                      help="internal: scan_runs row to report progress to (set by the web UI's scan orchestrator)")
     args = ap.parse_args()
 
     if args.workers < 1:
         ap.error("--workers must be >= 1")
+    if args.pool_generation_chunks is None:
+        args.pool_generation_chunks = 100 if args.executor == "loky" else 0
+    if args.executor == "loky":
+        if _loky_get_reusable_executor is None:
+            ap.error("--executor loky (the default) requires the 'loky' package — pip install -r "
+                      "requirements.txt, or pass --executor fork to use the old stdlib-only behavior "
+                      "instead (unbounded memory use, only --min-available-ram-percent protects it)")
+        if args.max_tasks_per_child:
+            ap.error("--max-tasks-per-child is a stdlib ProcessPoolExecutor concept and has no effect "
+                      "under --executor loky — use --pool-generation-chunks instead")
 
     init_db(args.db)
 
@@ -1008,6 +1311,8 @@ def main():
                 print(f"  ...{i:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
                 update_scan_run(args.db, args.run_id, stage_done=i,
                                  message=f"{i:,}/{len(pairs):,} pairs scored", updated_at=time.time())
+                if _check_and_handle_low_memory(args):
+                    sys.exit(1)
         done_pairs = len(pairs)
     else:
         def _pair_cost(preview_id, candidate_id):
@@ -1018,22 +1323,18 @@ def main():
         generations = [chunks[i:i + gen_size] for i in range(0, len(chunks), gen_size)]
 
         for gen_chunks in generations:
-            # A fresh ProcessPoolExecutor per generation — see module
-            # docstring's MEMORY GROWTH section. Each one forks brand new
-            # workers from this (still-COW-shareable) main process, so
-            # accumulated page-divergence from the previous generation's
-            # workers is discarded when they exit; this constructor call
-            # only runs once this generation's pool object exists, going
-            # through _launch_processes() (manager thread is None at this
-            # point) rather than _adjust_process_count()'s replace-a-
-            # worker-while-the-pool-is-live path — see --pool-generation-
-            # chunks' own help text for why that distinction matters.
-            with ProcessPoolExecutor(
-                max_workers=args.workers, initializer=_init_worker,
-                initargs=(scenes_by_video, audio_by_video, args.hash_threshold, args.color_threshold,
-                          args.trim_worker_memory, args.debug_memory_objects),
-                max_tasks_per_child=(args.max_tasks_per_child or None),
-            ) as pool:
+            # A fresh pool per generation — see module docstring's MEMORY
+            # GROWTH section. Each one launches brand new workers from
+            # this main process, so accumulated page-divergence
+            # (--executor fork) or per-worker private-copy growth
+            # (--executor loky) from the previous generation's workers is
+            # discarded when they exit; this constructor call only runs
+            # once this generation's pool object exists, going through
+            # _launch_processes() (manager thread is None at this point)
+            # rather than _adjust_process_count()'s replace-a-worker-
+            # while-the-pool-is-live path — see --pool-generation-chunks'
+            # own help text for why that distinction matters.
+            with _make_pool(args, scenes_by_video, audio_by_video) as pool:
                 futures = {pool.submit(_score_chunk, chunk): len(chunk) for chunk in gen_chunks}
                 for fut in as_completed(futures):
                     for preview_id, candidate_id, res in fut.result():
@@ -1046,6 +1347,8 @@ def main():
                     print(f"  ...{done_pairs:,}/{len(pairs):,} pairs scored ({(time.time()-t0):.1f}s elapsed)")
                     update_scan_run(args.db, args.run_id, stage_done=done_pairs,
                                      message=f"{done_pairs:,}/{len(pairs):,} pairs scored", updated_at=time.time())
+                    if _check_and_handle_low_memory(args, pool):
+                        sys.exit(1)
             # pool.shutdown(wait=True) already ran via __exit__ above —
             # the next generation's pool (if any) only gets constructed
             # after this one's manager thread and all workers have fully

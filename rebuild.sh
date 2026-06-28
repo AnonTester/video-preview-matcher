@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the preview-matcher image and (re)start the container.
+# Rebuild the video-preview-matcher image and (re)start the container.
 #
 # Uses docker-preview-matcher.yml — a local, gitignored compose override
 # with your actual library/staging/app-state paths (see README's "Docker

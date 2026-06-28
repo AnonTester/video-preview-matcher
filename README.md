@@ -1,4 +1,4 @@
-# Preview Matcher
+# Video Preview Matcher
 
 Finds preview/trailer clips in a large video library that are derived from a
 full-length video already in the library — even when the preview reorders
@@ -54,7 +54,7 @@ below — and produces correct results; no surprises switching to it.)
 ## Run
 
 ```bash
-cd preview-matcher
+cd video-preview-matcher
 
 python3 src/01_inventory.py /path/to/library [/path/to/another ...] --db data/library.db
 # Multiple library roots can be scanned in one run (space-separated). If no
@@ -82,7 +82,9 @@ python3 src/03_match.py --db data/library.db --workers 8
 # Pure hash comparison, no video decoding or other I/O — scales cleanly
 # across cores. --workers defaults to cpu count - 1; 1 = sequential (no
 # process pool), useful for debugging. Safe to re-run repeatedly while
-# tuning thresholds below.
+# tuning thresholds below. Defaults to --executor loky with periodic
+# worker recycling and a --min-available-ram-percent safety abort, both
+# prioritizing bounded memory over raw speed — see TUNING.md.
 
 python3 src/04_serve.py --db data/library.db
 # Open http://127.0.0.1:8000
@@ -142,9 +144,13 @@ to run the pipeline; you don't need a terminal for day-to-day use:
   only the directory you just added files to).
 - **Optional limit**: caps how many files get processed, for a quick
   sanity check before committing to a full run (mirrors `--limit` above).
-- **GPU decode (VAAPI)**: on by default, mirrors `--hwaccel vaapi` above
-   — only affects the fingerprint stage's decode step, not the rest of 
-   the pipeline.
+- **GPU decode (VAAPI)**: off by default, mirrors `--hwaccel vaapi` above
+   — only affects the fingerprint stage's decode step, not the rest of
+   the pipeline. Measured slower than CPU decode for most content on the
+   reference hardware (see [BENCHMARKS.md](BENCHMARKS.md)), which is why
+   this defaults off — VAAPI is still used automatically for any video
+   above `--extract-max-dim` regardless of this checkbox, where it's a
+   real win.
 - **Fingerprint workers / Match workers** (optional, shown only when the
   relevant stage is selected): sets each stage's *starting* worker count
   (mirrors each stage's `--workers` above; both default if left blank).
@@ -198,220 +204,23 @@ Only one scan can run at a time. The pipeline stages above remain
 runnable by hand (e.g. via `docker compose run`) if you want direct
 control instead.
 
-## Tuning — READ THIS BEFORE TRUSTING THE OUTPUT
+## Tuning
 
 This was built and validated against a small synthetic test library (see
 `tests/` and the conversation that produced this code), not your actual
-6000-file library. The defaults are reasonable starting points, not
-calibrated values. Expect to spend real time here:
-
-- **`--scene-threshold`** (`02_fingerprint.py`, default `0.3`): ffmpeg's
-  scene-change sensitivity. Lower = more scenes detected. In testing
-  against low-texture synthetic clips this missed real cuts at `0.15`,
-  let alone `0.3` — run `--limit 20` against a handful of *real* preview
-  files first and manually check `scenes` table row counts look sane
-  (`SELECT video_id, COUNT(*) FROM scenes GROUP BY video_id`) before
-  committing to a full run.
-
-- **`--top-margin` / `--bottom-margin` / `--side-margin`**
-  (`02_fingerprint.py`, defaults `0.12/0.12/0.06`): fraction of the frame
-  excluded before hashing, to dodge logos/bars/scrollers. These are
-  guesses. Pull a few actual preview frames
-  (`ffmpeg -i preview.mp4 -ss 5 -frames:v 1 frame.jpg`) and eyeball where
-  your overlays actually sit — adjust margins to comfortably clear them
-  without cropping into real content.
-
-- **`--blank-std-threshold`** (`02_fingerprint.py`, default `4.0`): skips
-  fingerprinting a frame if its grayscale standard deviation is below
-  this — catches fade-to-black transitions and blank intro/logo cards,
-  which otherwise hash to the same degenerate value across *every* video
-  in the library and produce confident-looking but meaningless matches
-  (confirmed in real use — see CHANGELOG 0.3.0). Raise it if you suspect
-  legitimately low-contrast (but not actually blank) scenes are getting
-  skipped; lower it if it's not catching frames that are visibly blank.
-
-- **`--hash-threshold`** (`03_match.py`, default `8`, range 0-64): max
-  Hamming distance to count two frames as the same scene. Lower = stricter.
-  Real-world re-encoding/bitrate differences will push this up from what
-  worked in lightly-compressed synthetic tests. If you see obviously-correct
-  matches scoring low, raise this; if you see false positives, lower it.
-  (Lowered from the original default of 12 after three real false
-  positives all turned out to sit exactly at that boundary — see
-  `--min-matched-scenes` below for the other half of that fix.)
-
-- **`--color-threshold`** (`03_match.py`, default `0.25`): guards against
-  pHash's color-blind-spot (see `phash.py` docstring on `color_signature`)
-  — two structurally-similar but differently-colored frames shouldn't
-  count as a match. Loosen if legitimately-cropped scenes are getting
-  rejected (cropping shifts the color histogram).
-
-- **`--min-ratio` / `--max-ratio`** (`03_match.py`, defaults `0.02`/`0.95`):
-  preview-duration / candidate-duration bounds for the prefilter. If your
-  previews can be a larger fraction of the source than 95%, widen this.
-
-- **`--min-matched-scenes`** (`03_match.py`, default `3`): a match is only
-  stored if at least this many *distinct candidate scenes* matched, *in
-  addition to* clearing `--min-visual-score`'s fraction — not the raw
-  count of matched preview scenes; several preview scenes matching the
-  identical candidate scene collapse into one piece of evidence (see
-  the `--min-candidate-match-spread` entry below for the real false
-  positive — video #936 — that found this distinction mattered, not
-  just in theory). Added because a preview with very few total scenes
-  (e.g. 2) only needs *one* coincidental match to clear a fraction-only
-  threshold (1/2 = 50%) — exactly what happened with three real false
-  positives in this library, each a single isolated match at the
-  hash-threshold boundary on a 2-6-scene preview. A real preview
-  splices together several moments from its source; one matching scene
-  is weak, easily-coincidental evidence on its own, not confirmation.
-
-- **`--min-scene-duration`** (`03_match.py`, default `5.0` seconds): drops
-  any scene whose gap to the next scene-cut in its own video is shorter
-  than this, before scoring. Added after a real false positive (review
-  video #2237): a shared intro/logo animation got chopped by scene
-  detection into several quick cuts, all of which matched and cleared
-  `--min-matched-scenes` (3/3) — but they were all the same ~4-second
-  sting, not independent evidence. A scene this short isn't an
-  independently identifiable moment either way. Raised from an initial
-  `2.0` after real review kept surfacing short flash/strobe-ish cuts
-  that still slipped through at that floor — raise it further if
-  rapid-cut footage keeps slipping through, lower it if legitimate
-  short scenes are being dropped.
-
-- **`--min-match-spread`** (`03_match.py`, default `2.0` seconds): skips
-  storing a match if its matched scenes' *preview* timestamps span less
-  than this many seconds — several matched scenes that are all really
-  the same narrow moment (e.g. a shared title card) aren't independent
-  corroboration just because there happen to be `--min-matched-scenes`
-  of them. Same starting-point caveat as `--min-scene-duration` above.
-
-- **`--min-candidate-match-spread`** (`03_match.py`, default `2.0`
-  seconds): the same spread check, mirrored onto the matched scenes'
-  *candidate* timestamps. Added after a real false positive (review
-  video #4059): a ~2.8s intro appeared three separate times in the
-  preview, well spread out — clearing `--min-match-spread` on the
-  preview side — but the candidate only had that intro once, so all
-  three matches collapsed onto one candidate timestamp. The candidate
-  wasn't a match at all; `--min-match-spread` alone can't see that,
-  since it never looks at the candidate side. Both spread checks must
-  pass — corroboration needs independence on both sides, not just one.
-  **This alone wasn't enough**, found via a second real false positive
-  (review video #936): 6 preview scenes (a repeated camera-flash frame)
-  all matched the *identical* candidate timestamp, but one *additional*,
-  genuinely unrelated coincidental match elsewhere in the candidate was
-  on its own enough to clear this spread check — spread (max − min) is
-  blind to *repetition* of the same value, since duplicates never move
-  the min or the max. Fixed in `--min-matched-scenes` itself (see
-  above), not here — this check's own spread math needed no change.
-
-- **Audio scoring** (`chromaprint_similarity` in `03_match.py`): shipped
-  as a deliberately simple bit-overlap comparator, explicitly flagged in
-  its docstring as a placeholder. Since previews here may have narration
-  replacing the original audio, audio is already weighted lower (0.35)
-  and skipped entirely (not penalized) when fingerprints don't both exist
-  — but for the cases where it *does* apply, swapping in proper
-  `pyacoustid`-based offset-alignment would meaningfully improve audio
-  scoring accuracy. Worth doing if early review passes show visual-only
-  scoring isn't discriminating well enough on its own.
-
-- **`--hwaccel`** (`02_fingerprint.py`, default `none`): set to `vaapi` to
-  decode on a VAAPI-capable GPU instead of the CPU (the `select`
-  scene-detection filter still runs in software either way, since it
-  needs raw frame data — only decode is offloaded). This uses the AMD GPU
-  at `/dev/dri/renderD128` by default (`--hwaccel-device` to override). 
-  Multiple `--workers` share the same physical decode hardware under 
-  vaapi, so tune worker count against GPU throughput, not just CPU core 
-  count, once this is on.
-
-- **`--workers`** (`02_fingerprint.py`, default `4`): each worker is a
-  full ffmpeg decode pass plus GPU/CPU contention if `--hwaccel vaapi` is
-  on, so this is genuinely constrained by hardware throughput, not just
-  "more is better" — 4 was found to be about right for CPU-only decode, 
-  and roughly the same under VAAPI (GPU `Enc` sits at 90%+ already at that
-  count per `nvtop`/`radeontop`). Can be raised or lowered *live* while a
-  web-UI-triggered scan is running (min 2, max = CPU core count) — see
-  "Triggering scans from the web UI" above — so it's worth experimenting
-  with mid-run rather than guessing up front and restarting.
-
-- **`--workers`** (`03_match.py`, default cpu count − 1): no I/O/GPU
-  contention (pure in-memory hashing after the preload), so more cores
-  should mostly help CPU-wise — but RAM is a separate, still-unresolved
-  story. On the real ~5000-video library, a full 15-worker run's memory
-  climbs steadily over the run (~2.7GB → ~5.5GB → ~8GB), dropping to
-  baseline the instant it finishes. This traces to copy-on-write
-  divergence: pages shared between the main process and every forked
-  worker gradually become private copies as each worker touches more of
-  the preloaded scene data — confirmed *not* a leak (no process's own
-  RSS or object count grows over a run) and not reclaimable by
-  `gc.collect()`/`malloc_trim()` (nothing's actually freed; shared pages
-  are just losing their shared status). The obvious fix — recycling
-  workers via `--max-tasks-per-child` — is unsafe: `ProcessPoolExecutor`
-  forks a replacement worker while its own background thread is still
-  alive, a real, currently unresolved CPython bug present in every
-  version with this feature (3.11 onward), not specific to the version
-  in use here —
-  [cpython#90622](https://github.com/python/cpython/issues/90622) and
-  [#115634](https://github.com/python/cpython/issues/115634) (open,
-  with active discussion as recently as May 2026 — a Python upgrade or
-  downgrade will not avoid it). Leave `--max-tasks-per-child` at `0`.
-  `--pool-generation-chunks` (periodic full pool teardown + recreation
-  instead of in-place recycling) sidesteps that specific deadlock, but
-  measured live against the real library it made the memory *peak*
-  worse, not better — still an open problem. `--workers 1` is the only
-  currently memory-bounded option for very large libraries. 
-
-- **`--progress-interval`** (`03_match.py`, default `10.0` seconds,
-  `--workers > 1` only): target seconds of work per chunk, so progress
-  updates land roughly this often. Without it, chunk *count* is fixed at
-  `workers * 4` (floored at 40) regardless of how many pairs there are —
-  fine for a small test run (each chunk finishes in seconds either way)
-  but means a real full-library run's chunks grow in lockstep with the
-  pair count, reporting progress only every few minutes once there are
-  millions of pairs. Translated to a pairs-per-chunk target via a rough
-  single-worker throughput estimate (`PAIRS_PER_WORKER_SEC` in
-  `03_match.py`) measured from the one real pre-vectorization benchmark
-  on record — likely conservative now that scoring is vectorized
-  (chunks will probably finish faster than requested, not slower), so
-  treat the actual observed cadence as the thing to calibrate against,
-  not this default.
+6000-file library — the defaults are reasonable starting points, not
+calibrated values. **See [TUNING.md](TUNING.md)** for every flag worth
+adjusting (with the real false-positive incidents and benchmarks behind
+each default) and **[BENCHMARKS.md](BENCHMARKS.md)** for the real numbers
+those defaults were picked from. Run `contrib/benchmark_settings.py` (see
+its own [README](contrib/README.md)) against your own library to find good
+settings for your own hardware instead of assuming either file's numbers
+transfer.
 
 **Recommended first real run:** `--limit 100` (or point `01_inventory.py`
 at a small subdirectory) through the whole pipeline, review results in the
-UI, adjust thresholds, repeat — before committing to fingerprinting 
+UI, adjust thresholds, repeat — before committing to fingerprinting
 thousands of files. Fingerprinting is the expensive stage.
-
-### Benchmarks
-
-Real numbers from one specific machine (AMD Ryzen 7 7840HS w/ Radeon
-780M Graphics, 32GB RAM) — a useful reference point, not a guarantee for
-your hardware.
-
-- **Matching (`03_match.py`)**, real 5000-video library, 11,728,306
-  candidate pairs after the duration prefilter, `--workers 15`:
-  - Pre-vectorization (nested Python loops): ~16.5 minutes.
-  - Post-vectorization (numpy `score_scenes`): ~7.5 minutes — roughly
-    2.2x faster, consistent across multiple runs.
-  - Memory (`docker stats`, whole container): climbs from ~2.7-2.9GB
-    shortly after starting to ~5.3-5.5GB at 50% progress to ~8GB near
-    completion, dropping to ~42MB the instant the run finishes — see
-    the `--workers` entry above for why this still isn't resolved.
-  - ~6000-video library, 16,673,930 candidate pairs, 8 workers, total time ~12 minutes, memory usage gradually climbing to 11.2GB
-  - amount of CPU workers does not appear to significantly impact the memory usage during matching
-- **Fingerprinting (`02_fingerprint.py`) worker count**: 4 workers
-  tested faster than 6 or 8 on this hardware — more workers contending
-  for the same decode hardware/CPU cache stopped paying off well before
-  the core count. Real experienced results for info, but with mixed 
-  different videos - not a benchmark!:
-  - 1000 mixed videos - 8 workers - total time ~4h
-  - 2000 mixed videos - 6 workers - total time ~13h
-  - 1000 mixed videos - 8 workers - total time ~9h
-  - 1000 mixed videos - 4 workers - total time ~6h
-  Memory usage with 4 workers is around 1.8GB
-- **Fingerprinting CPU vs. GPU (`--hwaccel vaapi`) decode time**: not
-  yet benchmarked head-to-head. VAAPI decode has been validated for
-  *correctness* (right scene count, correct decode) on this hardware's
-  AMD iGPU, but no real before/after timing comparison has been run —
-  worth doing before assuming GPU decode is actually faster in practice
-  for this specific workload.
 
 ## Review UI
 
@@ -423,8 +232,7 @@ favicon doubles as the "add to home screen" icon on Android (via
 `static/manifest.webmanifest`), so a shortcut on the home screen opens
 without browser chrome, like an app.
 
-- Queue (`/`) shows the logo and "Preview Matcher" title as one
-  clickable link back to `/`, and has three tabs: **Pending** lists every truly-undecided
+- Queue (`/`) has three tabs: **Pending** lists every truly-undecided
   preview with at least one candidate match above the noise floor,
   sorted by confidence; **Staged** lists every preview currently staged
   for deletion, most recently staged first; **Rejected** lists every
@@ -454,12 +262,12 @@ without browser chrome, like an app.
   hash distance, both timestamps, each side's scene duration (gap to its
   own next scene-cut — short durations on both sides are exactly the
   shared-intro/logo false-positive pattern that `--min-scene-duration`
-  guards against, see "Tuning"), and crop/flip variant, plus a summary
-  line stating whether the matches spread across multiple distinct
-  moments in *both* the preview and the candidate, or collapse onto a
-  single point in either one (weak, coincidental-prone evidence either
-  way — see "Tuning" → `--min-matched-scenes`/`--min-match-spread`/
-  `--min-candidate-match-spread`) — useful for judging a
+  guards against, see [TUNING.md](TUNING.md)), and crop/flip variant,
+  plus a summary line stating whether the matches spread across multiple
+  distinct moments in *both* the preview and the candidate, or collapse
+  onto a single point in either one (weak, coincidental-prone evidence
+  either way — see [TUNING.md](TUNING.md)'s `--min-matched-scenes`/
+  `--min-match-spread`/`--min-candidate-match-spread`) — useful for judging a
   match even when (or especially when) playback isn't available, and for
   spotting a confidently-wrong match before trusting it.
 - If a file fails to play in-browser, you'll see an inline message
@@ -533,7 +341,7 @@ the whole directory at any time (rebuilt on next playback).
 ## Project layout
 
 ```
-preview-matcher/
+video-preview-matcher/
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml     generic sample — copy/edit for your own paths
@@ -541,6 +349,8 @@ preview-matcher/
 ├── rebuild.sh             docker compose build && up -d
 ├── VERSION
 ├── CHANGELOG.md
+├── TUNING.md              Every tunable flag, with the real incidents/benchmarks behind each default
+├── BENCHMARKS.md          Real numbers backing TUNING.md's defaults
 ├── src/
 │   ├── db.py              SQLite schema + connection helper
 │   ├── phash.py           Vendored perceptual hash + color signature
@@ -569,6 +379,9 @@ preview-matcher/
 │   ├── fingerprint_worker_scaling_test.py
 │   ├── fingerprint_write_test.py
 │   └── playback_remux_test.py
+├── contrib/
+│   └── benchmark_settings.py   Finds good --workers/--hwaccel/--executor
+│                                settings for *your* machine and library
 └── data/
     ├── library.db          Created on first run
     ├── subprocess.log      ffmpeg/ffprobe/fpcalc call log (debug)

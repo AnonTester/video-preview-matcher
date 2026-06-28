@@ -443,7 +443,7 @@ def test_score_chunk_result_unaffected_by_memory_trim():
     }
     direct = match_mod.score_pair(scenes_by_video, {}, preview_id=1, candidate_id=2, hash_threshold=8, color_threshold=0.25)
     for trim_memory in (False, True):
-        match_mod._WORKER_STATE.update({
+        match_mod._worker_state().update({
             "scenes": scenes_by_video, "audio": {}, "hash_threshold": 8, "color_threshold": 0.25,
             "trim_memory": trim_memory,
         })

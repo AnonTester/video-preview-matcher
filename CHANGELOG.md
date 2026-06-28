@@ -1,5 +1,184 @@
 # Changelog
 
+## 2026-06-29 — 0.20.1
+
+- **Fix (same-day follow-up, real user feedback): the scan panel's
+  "match workers" field still showed `placeholder="auto"`**, left over
+  from when `03_match.py --workers` auto-detected from `cpu_count`.
+  0.20.0 changed that default to a fixed `8` but missed this UI
+  leftover, so the input looked like it was still auto-sizing per host
+  when it was actually just an empty field defaulting to the new fixed
+  value. Updated the placeholder to `8`.
+
+## 2026-06-28 — 0.20.0
+
+- **Fingerprinting CPU-vs-VAAPI benchmarked head-to-head for real**
+  (previously an open item) — `--workers` 1/4/8/12/15/16 × `--hwaccel`
+  none/vaapi against an 80-video stratified-random sample (23.6h of
+  content, spanning the library's actual duration/resolution mix) and a
+  per-video breakdown joined against real resolution/bitrate/duration.
+  CPU throughput plateaus hard at 4 workers and stays flat through 16;
+  VAAPI is consistently slower than CPU at every worker count (~3x on
+  average), with no resolution/bitrate pocket where it clearly wins on
+  its own. **`--hwaccel` stays `none` by default, and the web UI's "GPU
+  decode (VAAPI)" scan-panel checkbox now defaults unticked** (previously
+  ticked) for this reason. Full numbers in the new `BENCHMARKS.md`.
+- **Three proposed ffmpeg optimizations implemented and tested, with
+  mixed results:**
+  - `-fps_mode vfr` replaces the deprecated `-vsync vfr` (safe, real,
+    applied) — a proposed `setpts=N/FRAME_RATE/TB` addition was *not*
+    applied: verified it would silently replace every scene's real
+    timestamp with a synthetic frame-index-based one, corrupting
+    `scenes.timestamp_sec` for every video.
+  - **`--scene-detection-mode keyframe`** (new, EXPERIMENTAL, not
+    default): `-skip_frame nokey` decodes only the source's own
+    keyframes instead of running real scene-cut detection — ~29%
+    faster, but scene counts balloon (mean 52.6 vs. 21.7 scenes/video;
+    36% of videos saturate `--max-scenes` vs. 1%), likely costing more
+    in downstream matching time than it saves here.
+  - **`--extract-max-dim`** (new, default `1920`): downscales extracted
+    frames above this size before hashing, applied only to frames that
+    already passed scene selection (an initial version applied it
+    *before* selection and measured ~6x *slower*, not faster, since
+    every decoded frame paid the cost instead of just the kept ones).
+    A genuine no-op below the threshold (the filter is skipped from the
+    ffmpeg command entirely when known width/height already fit, not
+    just asked to do nothing) and accuracy-preserving above it (hash
+    distance 0-2 vs. the unscaled version on the one real 4K video on
+    record, far under `--hash-threshold`'s default of 8).
+- **`--force-vaapi-above-max-dim`** (new, default on): forces VAAPI
+  decode for any single video whose known resolution exceeds
+  `--extract-max-dim`, regardless of `--hwaccel`/the scan-panel
+  checkbox. VAAPI *alone* is still slower than CPU even at true 4K
+  (281.4s vs. 206.5s on the one real 4K video on record), but VAAPI
+  *combined* with the downscale above was the fastest and lowest-memory
+  combination of all four tested for that video (135.3s/838MB vs.
+  CPU+downscale's 207.0s/1030MB) — `scale_vaapi` shrinks the frame
+  *before* `hwdownload`, cutting a transfer whose cost scales with the
+  *original* (huge) frame size. Verified live: a normal sub-threshold
+  video used plain CPU decode while the 4K video in the same run
+  automatically got VAAPI, despite `--hwaccel none` being passed for
+  the run as a whole.
+- **`03_match.py --workers` now defaults to a fixed `8`**, not an
+  auto-detected `cpu_count - 1` — picked from a real worker-count-vs-
+  memory matrix (4/8/16) against the full library under `--executor
+  loky`: 8 was the actual sweet spot (16 raised the memory ceiling ~35%
+  for no speed benefit; 4 saved little memory but cost ~72% more time).
+  **`--pool-generation-chunks` now defaults to `100`** (was 50) under
+  `--executor loky` — a 20/50/100-chunk matrix held memory in a narrow
+  ~2.4-2.74GB band throughout (vs. fork's documented ~11.2GB, or the
+  9.4GB+ unbounded climb with no recycling at all) while 100 ran ~35%
+  faster than 20; the memory difference between them was judged too
+  small to matter once already this far inside a safe range.
+- **Added `contrib/benchmark_settings.py`** — finds good
+  `--workers`/`--hwaccel`/`--executor`/`--pool-generation-chunks`
+  settings for *your* own machine and library instead of trusting
+  numbers measured on someone else's hardware. Never touches the real
+  database (every test runs against a throwaway copy); skips either
+  half (fingerprinting/matching) with a clear message if there isn't
+  enough data for it yet. Defaults to a small, fast worker-count sweep
+  (1/half/cores-1); pass explicit worker lists for a more thorough one.
+- **Split the README's Tuning and Benchmarks sections into their own
+  files** — `TUNING.md` (every tunable flag, with the real incidents
+  and benchmarks behind each default) and `BENCHMARKS.md` (the real
+  numbers those defaults were picked from, now with full tables for all
+  of the above). `README.md` links to both instead of containing them
+  inline, shortening it considerably.
+- Renamed the app from "Preview Matcher" to "Video Preview Matcher"
+  everywhere it's user-visible (page title, topbar brand, PWA manifest
+  name/short_name, FastAPI title, logo accessibility title, CSS header
+  comment) and fixed some pre-existing drift found while in there (the
+  public `docker-compose.yml` sample and a `cd preview-matcher`
+  instruction still said the old, pre-rename directory/image name even
+  though the real deployment and everything else already used
+  `video-preview-matcher`).
+
+## 2026-06-28 — 0.19.0
+
+- **`03_match.py` now defaults to `--executor loky --pool-generation-chunks
+  50`** (was `fork`/disabled) — promoted from opt-in to the default on
+  explicit instruction: bounded memory matters more than speed for this
+  stage, full stop. A slower run that finishes safely beats a fast one
+  that risks taking the whole host down. `--pool-generation-chunks`
+  defaults to 50 under `--executor loky` and stays 0 under `--executor
+  fork` (where recycling measured worse, not better — see 0.18.0).
+  `--executor fork` remains fully available as the explicit "raw"/
+  opt-out path (e.g. to avoid the `loky`/`psutil` dependencies
+  entirely), but its memory use is not bounded by anything else in this
+  script.
+- **Added `--min-available-ram-percent`** (default `8.0`) — a second,
+  independent safety net on top of the executor choice, applying under
+  *either* executor: checks real system memory (`psutil.virtual_memory()`'s
+  AVAILABLE figure, not FREE) after every completed chunk and aborts —
+  no matches written, existing data untouched — the moment it drops
+  below this percentage of total RAM. `_force_kill_pool()` terminates
+  every worker process directly rather than waiting for in-flight
+  chunks to drain (loky's own `shutdown(kill_workers=True)`, or a
+  direct `kill()` of each `ProcessPoolExecutor` child under `--executor
+  fork`). Exists specifically so `--executor fork` (chosen
+  deliberately) or any future `--workers`/`--pool-generation-chunks`/
+  library-size combination under `--executor loky` that isn't actually
+  bounded the way the one tested combination was still fails safely.
+  Verified live by forcing an immediate trip (an unreachable threshold
+  against a small seeded DB, both executors): clean exit code 1, zero
+  rows written, zero leftover worker processes confirmed via `ps aux`.
+  Re-confirmed the earlier seeded-DB correctness check (one real match
+  plus 8 noise videos) still scores the real match byte-identically
+  under the new defaults vs. explicit `--executor fork`.
+
+## 2026-06-28 — 0.18.0
+
+- **Added `--executor {fork,loky}` to `03_match.py`** (default `fork`,
+  unchanged) — a continuation of the long-running `03_match.py` memory-
+  growth investigation, this time testing whether the
+  third-party `loky` library's deadlock-safe worker-recycling (launches
+  workers via `fork()`-then-`exec()` instead of plain `fork()`, so no
+  inherited threads/locks survive to deadlock on replacement) could keep
+  memory bounded during a real full-library match run, per explicit
+  priority from the person who asked for this: **bounded memory matters
+  more than speed** — a slower run that finishes safely beats a fast one
+  that risks taking the host down.
+  - Two real, separate loky bugs had to be fixed/worked around first: a
+    module-level `ctypes.CDLL` global (`--trim-worker-memory`'s `_LIBC`)
+    crashed every `--executor loky` run outright, since loky's cloudpickle-
+    based task serialization can't pickle a live CDLL handle — fixed by
+    loading it lazily (`_get_libc()`), only on first use inside a worker,
+    never at import time. Separately, `_score_chunk` came back
+    `KeyError: 'scenes'` on every real pair — root cause is a confirmed,
+    currently open upstream loky bug
+    ([joblib/loky#359](https://github.com/joblib/loky/issues/359)):
+    cloudpickle gives every separately-submitted task its own
+    disconnected globals snapshot, so a module-level dict written by
+    `_init_worker` is invisible to `_score_chunk` even within the same
+    worker process. Worked around with `_worker_state()`, routing
+    through `sys.modules` (a real, persistent singleton per process)
+    instead of a bare global.
+  - Correctness verified on a small seeded DB: `--executor fork
+    --workers 1`, `--executor fork --workers 4`, `--executor loky
+    --workers 4`, and `--executor loky --workers 4
+    --pool-generation-chunks 2` all produced byte-identical `matches`
+    rows.
+  - Tested live against the real ~6000-video library (5907 videos,
+    16,418,461 pairs), `--workers 8`, monitored continuously with an
+    automatic safety abort (not just a manual promise) if available host
+    memory dropped below 2.5GB: with no forced recycling, memory climbed
+    steadily past 9.4GB before auto-aborting at 77% progress — no better
+    than `--executor fork`'s documented ~11.2GB-peak curve, since
+    removing copy-on-write divergence doesn't help when nothing was
+    shared to begin with. *With* `--pool-generation-chunks 50` added,
+    the run **completed** (879.6s, ~22% slower than `fork`'s documented
+    ~12min) with memory oscillating ~1.7-2.55GB the entire time instead
+    of ever climbing — roughly a 4.4x lower peak. This is the first
+    attempt in the whole memory-growth investigation that has actually
+    worked, on the metric that was asked for.
+  - `--executor` defaults to `fork` (current behavior, byte-for-byte
+    unchanged); `--executor loky --pool-generation-chunks N` is now the
+    recommended option for a large or memory-constrained library, ahead
+    of plain `--workers 1` — see `TUNING.md` and `BENCHMARKS.md` for the
+    full writeup. Only one worker count and one
+    `--pool-generation-chunks` value have been tested so far.
+  - Added `loky` and `psutil` to `requirements.txt`.
+
 ## 2026-06-27 — 0.17.2
 
 - **Fix (real bug, reported directly: "prune missing files" showed the

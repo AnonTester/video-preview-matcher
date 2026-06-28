@@ -5,6 +5,8 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 jinja2>=3.1.0
 tqdm>=4.66.0
+loky>=3.5.0     # 03_match.py's --executor loky (default, deadlock-safe worker recycling)
+psutil>=6.0.0   # 03_match.py's --min-available-ram-percent safety abort; also activates loky's own per-worker memory-leak detection
 
 # System (non-pip) dependencies required:
 #   ffmpeg / ffprobe   - video probing, scene extraction, frame dumping

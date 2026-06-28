@@ -1,4 +1,4 @@
-/* Preview Matcher — review console
+/* Video Preview Matcher — review console
    Design intent: a forensic/scan instrument, not a content app. The
    subject is confidence scores and frame-accurate comparison, so the
    palette stays low-contrast and quiet except where a score or action

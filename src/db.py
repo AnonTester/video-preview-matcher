@@ -1,5 +1,5 @@
 """
-db.py — SQLite schema and access layer for preview-matcher.
+db.py — SQLite schema and access layer for video-preview-matcher.
 
 Design notes:
 - One row per file in `videos`, with probe metadata + a `role` guess

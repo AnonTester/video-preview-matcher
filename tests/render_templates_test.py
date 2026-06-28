@@ -105,7 +105,7 @@ def main():
     ctx = build_index_context(db_path)
     tpl = env.get_template("index.html")
     out = tpl.render(**ctx)
-    assert "Preview Matcher" in out
+    assert "Video Preview Matcher" in out
     assert str(len(ctx["matches"])) in out or "0 previews" in out
     Path("/tmp/rendered_index.html").write_text(out)
     print(f"  OK — {len(out)} chars, {len(ctx['matches'])} match rows. Saved to /tmp/rendered_index.html")
@@ -113,14 +113,14 @@ def main():
     print("Rendering index.html (staged tab) ...")
     sctx = build_index_context(db_path, tab="staged")
     sout = tpl.render(**sctx)
-    assert "Preview Matcher" in sout
+    assert "Video Preview Matcher" in sout
     assert "Staged for deletion" in sout
     print(f"  OK — {len(sout)} chars, {len(sctx['matches'])} staged rows.")
 
     print("Rendering index.html (rejected tab) ...")
     rjctx = build_index_context(db_path, tab="rejected")
     rjout = tpl.render(**rjctx)
-    assert "Preview Matcher" in rjout
+    assert "Video Preview Matcher" in rjout
     assert "Rejected —" in rjout
     print(f"  OK — {len(rjout)} chars, {len(rjctx['matches'])} rejected rows.")
 

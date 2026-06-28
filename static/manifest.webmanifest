@@ -1,6 +1,6 @@
 {
-  "name": "Preview Matcher",
-  "short_name": "Preview Matcher",
+  "name": "Video Preview Matcher",
+  "short_name": "Video Preview Matcher",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0d0f12",

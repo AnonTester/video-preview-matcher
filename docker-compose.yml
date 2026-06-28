@@ -5,8 +5,8 @@
 services:
   app:
     build: .
-    image: preview-matcher
-    container_name: preview-matcher
+    image: video-preview-matcher
+    container_name: video-preview-matcher
     restart: unless-stopped
     ports:
       - "8700:8000"

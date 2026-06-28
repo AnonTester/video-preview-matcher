@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Preview Matcher — Review Queue</title>
+  <title>Video Preview Matcher — Review Queue</title>
   <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
   <link rel="icon" type="image/svg+xml" href="/static/logo.svg?v={{ app_version }}">
   <link rel="manifest" href="/static/manifest.webmanifest">
@@ -14,7 +14,7 @@
   <div class="topbar">
     <a class="brand-link" href="/">
       <img class="brand-logo" src="/static/logo.svg?v={{ app_version }}" alt="">
-      <div class="brand"><b>Preview Matcher</b> <span class="version">v{{ app_version }}</span></div>
+      <div class="brand"><b>Video Preview Matcher</b> <span class="version">v{{ app_version }}</span></div>
     </a>
     <div class="stats">
       <span>videos <span class="stat-val">{{ stats.total_videos }}</span></span>
@@ -51,16 +51,19 @@
         <span class="hint">(optional)</span>
       </label>
       <label class="scan-limit-label">
-        <input type="checkbox" id="scan-hwaccel" checked>
+        <input type="checkbox" id="scan-hwaccel">
         GPU decode (VAAPI)
-        <span class="hint">(fingerprinting only)</span>
+        <span class="hint">(fingerprinting only — off by default: measured slower than CPU
+          decode for most of this library, see README's Tuning section. Always used
+          automatically for any video above --extract-max-dim regardless of this
+          checkbox, where it's a real win)</span>
       </label>
       <label class="scan-limit-label" id="scan-fp-workers-label">
         fingerprint workers <input type="number" id="scan-fp-workers" min="2" placeholder="4">
         <span class="hint">(adjustable live once running)</span>
       </label>
       <label class="scan-limit-label" id="scan-match-workers-label">
-        match workers <input type="number" id="scan-match-workers" min="1" placeholder="auto">
+        match workers <input type="number" id="scan-match-workers" min="1" placeholder="8">
         <span class="hint">(optional)</span>
       </label>
       <button class="btn primary" id="scan-start-btn" onclick="startScan()">Start scan</button>
