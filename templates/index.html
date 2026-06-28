@@ -391,6 +391,11 @@
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({confirm: 'DELETE'})
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
       const j = await res.json();
       alert(`Deleted ${j.deleted} file(s).`);
       refreshStaging();
@@ -438,6 +443,11 @@
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({confirm: 'DELETE'})
       });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        alert('Error: ' + (err.detail || res.statusText));
+        return;
+      }
       const j = await res.json();
       alert(`Removed ${j.deleted} record(s).`);
       refreshMissing();

@@ -112,7 +112,18 @@ CREATE INDEX IF NOT EXISTS idx_matches_preview ON matches(preview_id, combined_s
 CREATE TABLE IF NOT EXISTS decisions (
     preview_id      INTEGER PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
     status          TEXT NOT NULL,        -- 'approved_delete' | 'rejected' | 'staged' | 'deleted'
-    matched_candidate_id INTEGER REFERENCES videos(id),
+    -- ON DELETE SET NULL, not CASCADE: matched_candidate_id is just a
+    -- historical reference to which candidate this preview was matched
+    -- against. If that candidate video is later pruned (e.g. it went
+    -- missing independently), the decision about *this* preview is
+    -- still valid and must survive — only the now-dangling reference
+    -- should clear. Without this, prune_missing_files()'s bulk DELETE
+    -- FROM videos fails outright with a FOREIGN KEY constraint error
+    -- the moment any missing video happens to be someone else's
+    -- matched_candidate_id — see CLAUDE.md's prune-missing-files
+    -- writeup for the real incident this caused (silent no-op in the
+    -- UI, since the frontend never checked the response status).
+    matched_candidate_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
     decided_at      REAL,
     note            TEXT
 );
@@ -208,6 +219,34 @@ def init_db(db_path: str | Path):
             conn.execute("ALTER TABLE scan_runs ADD COLUMN resume_baseline_done INTEGER DEFAULT 0")
         if not _column_exists(conn, "scan_runs", "resume_baseline_elapsed"):
             conn.execute("ALTER TABLE scan_runs ADD COLUMN resume_baseline_elapsed REAL DEFAULT 0")
+        # One-off migration: decisions.matched_candidate_id used to have no
+        # ON DELETE clause (SQLite default NO ACTION) on DBs created before
+        # this was fixed — see the column's comment in SCHEMA above for why
+        # that broke prune_missing_files(). SQLite has no ALTER TABLE to
+        # change an existing FK's ON DELETE clause, so detect the stale
+        # definition via PRAGMA foreign_key_list and rebuild the table.
+        # Nothing else REFERENCES decisions, so this rebuild is self-
+        # contained. Idempotent: re-checks the live FK definition every
+        # call, not just a version flag, so it's safe to call repeatedly.
+        fk_info = conn.execute("PRAGMA foreign_key_list(decisions)").fetchall()
+        matched_candidate_fk = next(
+            (r for r in fk_info if r["from"] == "matched_candidate_id"), None
+        )
+        if matched_candidate_fk and matched_candidate_fk["on_delete"] != "SET NULL":
+            conn.execute("ALTER TABLE decisions RENAME TO decisions_old")
+            conn.executescript(
+                """
+                CREATE TABLE decisions (
+                    preview_id      INTEGER PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+                    status          TEXT NOT NULL,
+                    matched_candidate_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+                    decided_at      REAL,
+                    note            TEXT
+                )
+                """
+            )
+            conn.execute("INSERT INTO decisions SELECT * FROM decisions_old")
+            conn.execute("DROP TABLE decisions_old")
 
 
 def update_scan_run(db_path: str | Path, run_id: int | None, **fields):

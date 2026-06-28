@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-06-27 — 0.17.2
+
+- **Fix (real bug, reported directly: "prune missing files" showed the
+  confirmation dialog but confirming did nothing — counter unchanged
+  even after a manual reload).** `decisions.matched_candidate_id` was
+  the only foreign key to `videos(id)` in the schema without an
+  `ON DELETE` clause — pruning a missing video that happened to be
+  recorded as some *other* preview's matched candidate failed outright
+  with a `FOREIGN KEY constraint failed` error (confirmed against a
+  real copy of the production DB: all 46 stuck rows hit this). The
+  route had no exception handling, so this 500'd; the frontend never
+  checked `res.ok` before parsing the response as JSON, so the failure
+  was completely silent. Fixed: `matched_candidate_id` is now
+  `ON DELETE SET NULL` (correct semantics — the decision itself should
+  survive its matched candidate being pruned later, only the dangling
+  reference should clear), with an `init_db()` migration to upgrade
+  already-deployed DBs (detected via `PRAGMA foreign_key_list`, since
+  SQLite can't `ALTER TABLE` an existing FK's `ON DELETE` clause).
+  Verified live against a real production DB copy: migration ran clean,
+  all 46 previously-stuck rows pruned successfully. Also hardened both
+  `pruneMissing()` and `purgeStaging()` in `index.html` to check
+  `res.ok` and surface real errors via `alert()`, matching the pattern
+  already used in `review.html` — so a future backend failure here
+  fails loudly instead of silently.
+
 ## 2026-06-27 — 0.17.1
 
 - **Fix (same-day follow-up, real user feedback): the new topbar logo

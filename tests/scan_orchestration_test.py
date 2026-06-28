@@ -100,6 +100,63 @@ def test_init_db_migration_is_idempotent():
     print("test_init_db_migration_is_idempotent: OK")
 
 
+def _matched_candidate_on_delete(conn):
+    fk_info = conn.execute("PRAGMA foreign_key_list(decisions)").fetchall()
+    row = next(r for r in fk_info if r["from"] == "matched_candidate_id")
+    return row["on_delete"]
+
+
+def test_fresh_db_has_set_null_on_matched_candidate_id():
+    """A fresh DB (the SCHEMA string, not a migration) must define
+    matched_candidate_id with ON DELETE SET NULL — see db.py's comment
+    on this column for the prune_missing_files() bug this guards
+    against."""
+    reset()
+    with connect(TMP_DB) as conn:
+        assert _matched_candidate_on_delete(conn) == "SET NULL"
+    print("test_fresh_db_has_set_null_on_matched_candidate_id: OK")
+
+
+def test_init_db_migrates_stale_matched_candidate_id_fk():
+    """The actual incident: DBs created before this fix have
+    matched_candidate_id with no ON DELETE clause (SQLite default NO
+    ACTION) — pruning a missing video referenced there fails outright
+    with a FOREIGN KEY constraint error. init_db() must detect and
+    rebuild the table on an already-existing, stale-schema DB, without
+    losing any existing decisions rows."""
+    TMP_DB.unlink(missing_ok=True)
+    with connect(TMP_DB) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE videos (id INTEGER PRIMARY KEY, path TEXT, filename TEXT,
+                duration_sec REAL, missing_since REAL);
+            CREATE TABLE decisions (
+                preview_id INTEGER PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                matched_candidate_id INTEGER REFERENCES videos(id),
+                decided_at REAL,
+                note TEXT
+            );
+            """
+        )
+        conn.execute("INSERT INTO videos (id, path, filename) VALUES (1, '/v/1.mp4', '1.mp4')")
+        conn.execute("INSERT INTO videos (id, path, filename) VALUES (2, '/v/2.mp4', '2.mp4')")
+        conn.execute(
+            "INSERT INTO decisions (preview_id, status, matched_candidate_id, decided_at) "
+            "VALUES (1, 'staged', 2, 5.0)"
+        )
+
+    init_db(TMP_DB)  # this is the migration under test
+
+    with connect(TMP_DB) as conn:
+        assert _matched_candidate_on_delete(conn) == "SET NULL"
+        row = conn.execute("SELECT * FROM decisions WHERE preview_id = 1").fetchone()
+        assert row["status"] == "staged"
+        assert row["matched_candidate_id"] == 2
+        assert row["decided_at"] == 5.0
+    print("test_init_db_migrates_stale_matched_candidate_id_fk: OK")
+
+
 def _seed_video(conn, vid, missing_since=None, duration_sec=10.0):
     conn.execute(
         "INSERT INTO videos (id, path, filename, duration_sec, missing_since) VALUES (?, ?, ?, ?, ?)",
@@ -777,6 +834,35 @@ def test_prune_missing_files_deletes_genuinely_missing_videos():
     print("test_prune_missing_files_deletes_genuinely_missing_videos: OK")
 
 
+def test_prune_missing_files_handles_video_referenced_as_matched_candidate():
+    """The actual reported bug: pruning silently did nothing in the UI.
+    Root cause: a missing video can be recorded as some *other*
+    preview's decisions.matched_candidate_id (the candidate it was
+    staged/rejected against) without itself being staged. Before this
+    was a real DB found in the wild, this combination wasn't covered by
+    any prior test — the bulk DELETE FROM videos raised
+    sqlite3.IntegrityError outright, which the route never caught (500),
+    and the frontend never checked res.ok before parsing JSON, so the
+    failure was completely invisible. The fix is the ON DELETE SET NULL
+    migration in db.py — this test seeds exactly this combination and
+    asserts pruning now succeeds, with the dangling reference cleared
+    but the decision itself intact."""
+    reset()
+    _reset_remux_dir()
+    with connect(TMP_DB) as conn:
+        _seed_video(conn, 1)  # preview, not itself missing
+        _seed_video(conn, 2, missing_since=200.0)  # candidate, now missing
+        _seed_decision(conn, 1, "staged", matched_candidate_id=2, decided_at=5.0)
+        pruned_ids = serve_mod.prune_missing_files(conn, REMUX_TEST_DIR)
+        remaining_ids = {r["id"] for r in conn.execute("SELECT id FROM videos").fetchall()}
+        decision = conn.execute("SELECT * FROM decisions WHERE preview_id = 1").fetchone()
+    assert pruned_ids == [2], pruned_ids
+    assert remaining_ids == {1}, remaining_ids
+    assert decision["status"] == "staged"
+    assert decision["matched_candidate_id"] is None, decision["matched_candidate_id"]
+    print("test_prune_missing_files_handles_video_referenced_as_matched_candidate: OK")
+
+
 def test_prune_missing_files_returns_empty_list_when_nothing_to_prune():
     reset()
     _reset_remux_dir()
@@ -876,6 +962,8 @@ if __name__ == "__main__":
     test_update_scan_run_noop_without_run_id()
     test_target_workers_column_exists_after_init_db()
     test_init_db_migration_is_idempotent()
+    test_fresh_db_has_set_null_on_matched_candidate_id()
+    test_init_db_migrates_stale_matched_candidate_id_fk()
     test_queue_rows_includes_normal_match()
     test_queue_rows_excludes_missing_preview()
     test_queue_rows_falls_back_to_second_best_when_top_candidate_missing()
@@ -894,6 +982,7 @@ if __name__ == "__main__":
     test_list_missing_files_includes_rejected_and_undecided()
     test_prune_missing_files_never_deletes_a_staged_video()
     test_prune_missing_files_deletes_genuinely_missing_videos()
+    test_prune_missing_files_handles_video_referenced_as_matched_candidate()
     test_prune_missing_files_returns_empty_list_when_nothing_to_prune()
     test_prune_missing_files_deletes_orphaned_remux_cache_entry()
     test_prune_missing_files_leaves_other_remux_cache_entries_alone()
