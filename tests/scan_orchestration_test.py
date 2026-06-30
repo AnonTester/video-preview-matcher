@@ -646,10 +646,53 @@ def test_resume_plan_limit_reduction_uses_cumulative_done_not_just_this_row():
 
 
 def test_resume_plan_preserves_started_at_and_start_stage():
-    plan = serve_mod._resume_plan(_row(started_at=12345.0, stage="match"))
+    # Non-match stage: started_at carries forward unmodified (point 3 in
+    # _resume_plan's docstring) — see the dedicated match tests below for
+    # why "match" specifically is the one exception to this.
+    plan = serve_mod._resume_plan(_row(started_at=12345.0, stage="fingerprint"))
     assert plan["started_at"] == 12345.0
-    assert plan["start_stage"] == "match"
+    assert plan["start_stage"] == "fingerprint"
     print("test_resume_plan_preserves_started_at_and_start_stage: OK")
+
+
+def test_resume_plan_match_stage_zeroes_baseline_and_resets_started_at():
+    """The actual bug, found live: 03_match.py has no incremental concept
+    at all (every invocation rescoring every pair from scratch) — a match
+    run that failed at stage_done == stage_total (it scored every pair,
+    then crashed writing the results) had that entire already-finished
+    count folded in as resume_baseline_done on resume, doubling the
+    displayed total (~16.4M + a fresh ~16.4M = ~32.8M) and inflating
+    "running for" with the fully-discarded prior attempt's own duration.
+    A match resume must be a clean restart: zero baseline_done/
+    baseline_elapsed, no --limit reduction, and started_at reset to None
+    so _start_scan's own "now" default applies instead of carrying
+    forward a stale timestamp from a run whose progress isn't actually
+    being continued."""
+    plan = serve_mod._resume_plan(_row(
+        stage="match", started_at=12345.0, stage_done=16_418_461,
+        stage_started_at=1000.0, finished_at=1932.3,
+        params_json='{"limit": null, "stages": ["match"]}',
+    ))
+    assert plan["baseline_done"] == 0, plan["baseline_done"]
+    assert plan["baseline_elapsed"] == 0.0, plan["baseline_elapsed"]
+    assert plan["started_at"] is None, plan["started_at"]
+    assert plan["start_stage"] == "match"
+    print("test_resume_plan_match_stage_zeroes_baseline_and_resets_started_at: OK")
+
+
+def test_resume_plan_match_stage_ignores_chained_resume_baselines_too():
+    """Same as above, but also confirms a match resume zeroes baseline_done
+    even when resume_baseline_done/resume_baseline_elapsed are already
+    nonzero from an earlier (non-match) resume hop earlier in the same
+    multi-stage run — match must never inherit *any* carried-forward
+    baseline, not just its own immediately-prior attempt's."""
+    plan = serve_mod._resume_plan(_row(
+        stage="match", stage_done=500, resume_baseline_done=200,
+        resume_baseline_elapsed=300.0,
+    ))
+    assert plan["baseline_done"] == 0, plan["baseline_done"]
+    assert plan["baseline_elapsed"] == 0.0, plan["baseline_elapsed"]
+    print("test_resume_plan_match_stage_ignores_chained_resume_baselines_too: OK")
 
 
 def test_resume_plan_computes_baseline_elapsed_from_active_processing_time():
@@ -1015,6 +1058,8 @@ if __name__ == "__main__":
     test_resume_plan_baseline_accumulates_across_chained_resumes()
     test_resume_plan_limit_reduction_uses_cumulative_done_not_just_this_row()
     test_resume_plan_preserves_started_at_and_start_stage()
+    test_resume_plan_match_stage_zeroes_baseline_and_resets_started_at()
+    test_resume_plan_match_stage_ignores_chained_resume_baselines_too()
     test_resume_plan_computes_baseline_elapsed_from_active_processing_time()
     test_resume_plan_baseline_elapsed_accumulates_across_chained_resumes()
     test_progress_with_baseline_adds_baseline_to_done_and_total()

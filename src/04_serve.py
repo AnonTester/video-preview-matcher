@@ -925,6 +925,34 @@ async def prune_missing_files_route(request: Request):
 # Scan orchestration (runs 01/02/03 as subprocesses; see module docstring)
 # ---------------------------------------------------------------------------
 
+def _log_stage_failure(db_path: str, run_id: int, stage_name: str, stage_file: str,
+                        returncode: int, tail: list[str]) -> str:
+    """Writes the full captured stage output to subprocess.log (the same file
+    01/02 already use for ffmpeg/ffprobe/fpcalc debug logging — one place to
+    look, not a second log nobody knows exists) and returns a short, single-
+    line summary for scan_runs.message. A full Python traceback dumped
+    straight into the scan-panel UI (found live: a real 03_match.py
+    IntegrityError showed as a multi-hundred-line wall of progress lines
+    plus the traceback, all jammed into one status line) is not something a
+    human should have to read in a tooltip — the UI needs a pointer, not the
+    whole transcript."""
+    full_output = "".join(tail) or f"{stage_file} exited {returncode}"
+    log_path = Path(db_path).parent / "subprocess.log"
+    try:
+        with open(log_path, "a") as f:
+            f.write(f"\n=== scan run {run_id}, stage {stage_name} failed (exit {returncode}), "
+                     f"{time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.write(full_output)
+            if not full_output.endswith("\n"):
+                f.write("\n")
+    except OSError:
+        pass  # best-effort — a failed scan must still be reported even if logging it fails
+
+    last_line = next((line.strip() for line in reversed(tail) if line.strip()), None)
+    summary = last_line if last_line else f"{stage_file} exited {returncode}"
+    return f"{stage_name} failed: {summary[:200]} (see {log_path.name} for full output)"
+
+
 def _build_cmd(stage_file: str, run_id: int, db_path: str, params: dict) -> list[str]:
     cmd = [sys.executable, str(APP_DIR / stage_file), "--db", db_path, "--run-id", str(run_id)]
     if stage_file in ("01_inventory.py", "02_fingerprint.py"):
@@ -1034,7 +1062,11 @@ def _run_scan_stages(run_id: int, params: dict, db_path: str, start_stage: str |
         tail = []
         for line in proc.stdout:
             tail.append(line)
-            tail = tail[-20:]
+            # 200 lines, not 20 — enough margin to hold a full Python traceback
+            # plus some progress-line context even on a chatty stage; this is
+            # only the in-memory buffer used to write the failure log below,
+            # not what ends up in scan_runs.message (see _summarize_failure).
+            tail = tail[-200:]
         proc.wait()
 
         with SCAN_LOCK:
@@ -1049,11 +1081,11 @@ def _run_scan_stages(run_id: int, params: dict, db_path: str, start_stage: str |
             return
 
         if proc.returncode != 0:
+            short_message = _log_stage_failure(db_path, run_id, stage_name, stage_file, proc.returncode, tail)
             with connect(db_path) as conn:
                 conn.execute(
                     "UPDATE scan_runs SET status=?, message=?, finished_at=? WHERE id=?",
-                    ("failed", ("".join(tail) or f"{stage_file} exited {proc.returncode}")[-2000:],
-                     time.time(), run_id),
+                    ("failed", short_message, time.time(), run_id),
                 )
             return
 
@@ -1389,27 +1421,57 @@ def _resume_plan(row: dict) -> dict:
        resume the rate starts out as essentially the prior attempt's own
        measured throughput, and naturally blends toward this
        invocation's own fresh numbers as they accumulate.
+
+    5. **None of the above applies to the match stage, and naively
+       applying it anyway doubles the displayed total.** Points 1-4 all
+       assume the stage being resumed is genuinely incremental — 01/02
+       skip already-current/already-fingerprinted items, so a prior
+       attempt's stage_done really is done-and-won't-be-redone work,
+       safe to carry forward as a baseline. 03_match.py has no such
+       concept at all: every invocation does `DELETE FROM matches` and
+       rescoring every pair from scratch, by design (see its own module
+       docstring/CLAUDE.md — it's "the cheap stage, designed to be
+       re-run repeatedly"). Found live: a match run failed at
+       stage_done == stage_total (it had scored every pair, then
+       crashed on the final write — see the FOREIGN KEY incident this
+       file's own CHANGELOG entry documents), then resuming it folded
+       that entire already-finished count in as resume_baseline_done —
+       so the fresh attempt's own ~16.4M-pair total got *added* to the
+       carried-forward ~16.4M baseline, displaying as a doubled ~32.8M
+       total counting up from 0, and resume_baseline_elapsed similarly
+       inflated "running for" with the entire discarded prior attempt's
+       duration on top of the new attempt's own clock. Fixed by zeroing
+       baseline_done/baseline_elapsed and resetting started_at to None
+       (→ _start_scan's own "now" default) whenever the stage being
+       resumed is "match" — a match resume is, correctly, just a clean
+       fresh start of that stage, not a continuation.
     """
     params = dict(json.loads(row["params_json"]))
 
     if row.get("target_workers"):
         params["fp_workers"] = row["target_workers"]
 
+    is_match_resume = row.get("stage") == "match"
+
     # Cumulative across every resume hop so far, not just this one row's
-    # own stage_done — see point 2 above for the bug this avoids.
-    baseline_done = (row.get("resume_baseline_done") or 0) + (row.get("stage_done") or 0)
+    # own stage_done — see point 2 above for the bug this avoids. Always
+    # 0 for match — see point 5 above; it has no incremental concept to
+    # carry forward.
+    baseline_done = 0 if is_match_resume else (
+        (row.get("resume_baseline_done") or 0) + (row.get("stage_done") or 0))
 
     # Likewise for active-processing time — see point 4 above. Uses this
     # row's own finished_at (set the moment it was paused/interrupted/
     # failed/cancelled), not "now", since that's when this row's own
     # stage_elapsed clock actually stopped.
     prior_attempt_elapsed = 0.0
-    if row.get("stage_started_at") and row.get("finished_at"):
+    if not is_match_resume and row.get("stage_started_at") and row.get("finished_at"):
         prior_attempt_elapsed = max(0.0, row["finished_at"] - row["stage_started_at"])
-    baseline_elapsed = (row.get("resume_baseline_elapsed") or 0) + prior_attempt_elapsed
+    baseline_elapsed = 0.0 if is_match_resume else (
+        (row.get("resume_baseline_elapsed") or 0) + prior_attempt_elapsed)
 
     first_stage_limit = None
-    if params.get("limit") and baseline_done:
+    if not is_match_resume and params.get("limit") and baseline_done:
         first_stage_limit = max(0, params["limit"] - baseline_done)
 
     return {
@@ -1418,7 +1480,7 @@ def _resume_plan(row: dict) -> dict:
         "first_stage_limit": first_stage_limit,
         "baseline_done": baseline_done,
         "baseline_elapsed": baseline_elapsed,
-        "started_at": row.get("started_at"),
+        "started_at": None if is_match_resume else row.get("started_at"),
     }
 
 

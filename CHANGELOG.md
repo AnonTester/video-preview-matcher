@@ -1,5 +1,84 @@
 # Changelog
 
+## 2026-06-30 — 0.20.4
+
+- **The scan panel's Pause button now hides while the match stage is
+  actively running, and the Resume offer is skipped after a match-stage
+  failure/interruption/cancellation.** Both implied a continuation
+  match can't deliver — 03_match.py has no checkpoint at all, every
+  invocation rescores every pair from scratch (see 0.20.3's
+  `_resume_plan` fix, which already made an actual Resume click safe,
+  just still mislabeled). Cancel remains available regardless of stage
+  — it never claimed resumability in the first place. Select "Match
+  only" and hit Start instead of Resume — same effect, honestly
+  labeled.
+- **Fix: the staging-bar (staged-file/missing-file summary strip below
+  the topbar) showed as an empty bar with nothing in it when there was
+  nothing to stage or prune.** Each of its four inner elements
+  (summary text + button, for both staging and missing files) already
+  individually hid itself at zero count, but the bar's own container
+  never did — it has its own padding/background/border (style.css),
+  so an empty bar still rendered as a visible second topbar. Now hides
+  entirely when both counts are zero.
+
+## 2026-06-30 — 0.20.3
+
+- **Fix: resuming a failed/interrupted match stage showed a doubled
+  pair total (e.g. ~16.4M shown as ~32.8M) and an inflated "running
+  for" time, and appeared to restart from scratch rather than
+  continuing.** Not a regression from 0.20.2's fix above — a separate,
+  general, pre-existing bug, only now exposed because match runs
+  rarely needed resuming before. `_resume_plan()`'s baseline-carrying
+  logic (`resume_baseline_done`/`resume_baseline_elapsed`/`started_at`)
+  was built for `01`/`02`'s genuinely incremental behavior, where a
+  prior attempt's completed work really is done and safe to carry
+  forward as a baseline. `03_match.py` has no such concept — every
+  invocation does `DELETE FROM matches` and rescoring every pair from
+  scratch, by design. Resuming a match run that had failed *after*
+  scoring every pair folded that already-finished count in as a
+  baseline, so the fresh attempt's own full pair count got added on
+  top of it (doubling the displayed total), and the entire discarded
+  prior attempt's duration got added to the new attempt's own elapsed
+  time. Fixed by special-casing the match stage in `_resume_plan()`:
+  baseline_done/baseline_elapsed are zeroed and `started_at` is reset
+  to `None` (→ a fresh "now") whenever the stage being resumed is
+  `match` — a match resume is, correctly, just a clean restart of that
+  stage, not a continuation. (The underlying re-score itself was never
+  actually "starting from 0 instead of continuing" in a *bad* sense —
+  that part is genuinely how `03_match.py` always works, cheap and
+  safe to redo — only the orchestrator's progress/elapsed *display*
+  was wrong.)
+
+## 2026-06-30 — 0.20.2
+
+- **Fix: a real ~16.4M-pair match run completed all scoring (932s) only
+  to crash on its very last step** with `sqlite3.IntegrityError: FOREIGN
+  KEY constraint failed`, storing zero new matches despite the run
+  otherwise succeeding in full. Root cause: a human pruned a missing
+  file via the web UI mid-run, which deletes that video's `videos` row
+  — but `03_match.py`'s in-memory results, resolved against `videos`
+  once at the start, still referenced it, and the final write loop's
+  `INSERT OR REPLACE INTO matches` tripped the FK constraint on that one
+  stale row. Because the whole write loop ran inside one uncommitted
+  transaction, the failure rolled back the *entire* run's results, not
+  just the bad row — wasting the full ~15.5 minutes for nothing (though
+  it did not corrupt any existing data: confirmed live that the
+  pre-existing `matches` table survived untouched). Fixed by wrapping
+  each row's `INSERT` in its own `try/except sqlite3.IntegrityError`,
+  skipping just the stale row (now reported as "N skipped, pruned
+  mid-run") instead of discarding every other still-valid result in the
+  same run.
+- **Fix: a failed scan stage dumped its entire captured output — for a
+  Python traceback, potentially hundreds of progress lines plus the
+  full stack trace — directly into the scan panel's status line**,
+  exactly as seen in the incident above. `04_serve.py`'s
+  `_log_stage_failure()` now writes the full output to `subprocess.log`
+  (the same debug log `01`/`02` already use, rather than a second log
+  nobody knows exists) and reduces `scan_runs.message` to a short,
+  single-line summary (the last non-blank captured line — for an
+  uncaught Python exception, that's exactly the exception type and
+  message) plus a pointer to the log file for the full transcript.
+
 ## 2026-06-29 — 0.20.1
 
 - **Fix (same-day follow-up, real user feedback): the scan panel's

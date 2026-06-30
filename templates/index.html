@@ -25,7 +25,7 @@
     </div>
   </div>
 
-  <div class="staging-bar">
+  <div class="staging-bar" id="staging-bar" style="display:none;">
     <span id="staging-summary" style="display:none;"></span>
     <button class="danger" id="staging-purge-btn" style="display:none;" onclick="purgeStaging()">empty staging folder</button>
     <span id="missing-summary" style="display:none;"></span>
@@ -366,20 +366,39 @@
       }
     }
 
+    // The bar itself (not just the summary/button pair inside it) must
+    // hide when there's nothing to show — found live: it has its own
+    // padding/background/border (style.css's .staging-bar), so even with
+    // both summary spans and both buttons individually hidden at zero
+    // count, the empty bar itself still rendered as a visible second
+    // topbar with nothing in it. Tracked as two booleans (not re-queried
+    // from the DOM) since refreshStaging/refreshMissing run independently
+    // and either one's result can flip the bar's visibility regardless of
+    // what the other last reported.
+    let stagingHasContent = false;
+    let missingHasContent = false;
+    function updateStagingBarVisibility() {
+      document.getElementById('staging-bar').style.display =
+        (stagingHasContent || missingHasContent) ? '' : 'none';
+    }
+
     async function refreshStaging() {
       const r = await fetch('/api/staging-summary');
       const d = await r.json();
       const summary = document.getElementById('staging-summary');
       const btn = document.getElementById('staging-purge-btn');
-      if (d.file_count === 0) {
+      stagingHasContent = d.file_count !== 0;
+      if (!stagingHasContent) {
         summary.style.display = 'none';
         btn.style.display = 'none';
+        updateStagingBarVisibility();
         return;
       }
       const mb = (d.total_bytes / (1024*1024)).toFixed(0);
       summary.style.display = '';
       btn.style.display = '';
       summary.textContent = `staging: ${d.file_count} files, ${mb} MB`;
+      updateStagingBarVisibility();
     }
     async function purgeStaging() {
       const r = await fetch('/api/staging-summary');
@@ -417,14 +436,17 @@
       const d = await r.json();
       const summary = document.getElementById('missing-summary');
       const btn = document.getElementById('missing-prune-btn');
-      if (d.files.length === 0) {
+      missingHasContent = d.files.length !== 0;
+      if (!missingHasContent) {
         summary.style.display = 'none';
         btn.style.display = 'none';
+        updateStagingBarVisibility();
         return;
       }
       summary.style.display = '';
       btn.style.display = '';
       summary.textContent = `missing: ${d.files.length} file(s)`;
+      updateStagingBarVisibility();
     }
 
     async function pruneMissing() {
@@ -699,6 +721,16 @@
         } else {
           liveWorkers.style.display = 'none';
         }
+
+        // Pause implies "this can be picked back up where it left off" —
+        // true for inventory/fingerprint (genuinely incremental, skip
+        // already-done work) but not match, which always rescoring every
+        // pair from scratch on every invocation (see _resume_plan's own
+        // match-stage special-case in 04_serve.py for the bug this same
+        // fact caused on the resume side). Showing Pause here would
+        // promise a continuation match can't deliver — Cancel stays
+        // available regardless of stage, since it never claims that.
+        document.getElementById('scan-pause-btn').style.display = (d.stage === 'match') ? 'none' : '';
         return;
       }
 
@@ -706,7 +738,12 @@
       progress.style.display = 'none';
       statusText.textContent = `last scan: ${d.status}` + (d.message ? ' — ' + d.message : '');
 
-      if (['paused', 'interrupted', 'failed', 'cancelled'].includes(d.status)) {
+      // Match has no checkpoint to resume into — every invocation rescoring
+      // every pair from scratch (see _resume_plan's match-stage special
+      // case in 04_serve.py) — so "Resume" here would just relabel a plain
+      // fresh restart as a continuation it isn't. Select "Match only" and
+      // hit Start instead — same effect, honest about what's happening.
+      if (d.stage !== 'match' && ['paused', 'interrupted', 'failed', 'cancelled'].includes(d.status)) {
         resumeBox.style.display = '';
         document.getElementById('scan-resume-text').textContent =
           `Resume ${d.stage ? STAGE_LABELS[d.stage] || d.stage : 'scan'}?`;

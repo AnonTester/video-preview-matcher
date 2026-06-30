@@ -429,6 +429,38 @@ unbounded/aborted no-recycling case or `--executor fork`'s documented
 this size once already this far inside a safe range. See BENCHMARKS.md
 for the full matrix.
 
+**A real production failure, unrelated to memory: a completed
+~16.4M-pair run (932.3s, every pair scored successfully) crashed on
+its very last step with `sqlite3.IntegrityError: FOREIGN KEY constraint
+failed`, storing zero new matches despite the run otherwise succeeding
+in full.** Root cause: `preview_id`/`candidate_id` are resolved against
+`videos` once, up front, via `load_all_scenes`/`load_all_audio` — but a
+real run takes minutes, long enough for a human to use the web UI's
+`/api/missing-files/prune` concurrently. Pruning deletes the
+now-stale video's `videos` row, which cascades away any of its
+existing `matches` rows too (`ON DELETE CASCADE`) — but this run's
+in-memory results still reference the now-gone id, and the final
+write loop's `INSERT OR REPLACE INTO matches` trips the FK constraint
+on it. Because the whole `DELETE FROM matches` + re-insert loop ran
+inside one connection's implicit transaction (`db.connect()` only
+calls `conn.commit()` on a clean exit; an uncaught exception skips
+straight to `conn.close()` in `finally`, which rolls back everything
+since the last commit), the failure didn't corrupt anything — confirmed
+live by checking the production DB immediately after: `matches` held
+exactly the count consistent with the *prior* successful run's results
+minus whatever prune's own cascade had already removed, not a partial
+or zero-row state. But it also meant the entire run's results were
+discarded, not just the one stale row — wasting the full ~15.5 minutes
+for zero new matches stored. Fixed by wrapping each row's `INSERT` in
+its own `try/except sqlite3.IntegrityError`, skipping just the stale
+row (logged via a `skipped_stale` count, surfaced in both the CLI
+output and `scan_runs.message`) instead of letting one race-lost row
+take down every other still-valid result in the same run. The
+`matches` table's only two FKs are `preview_id`/`candidate_id`, both
+`ON DELETE CASCADE` to `videos(id)` — there's no other constraint this
+specific INSERT could trip, so catching `IntegrityError` here is
+unambiguous, not a broad catch-all.
+
 Usage:
     python3 src/03_match.py --db data/library.db [--hash-threshold 8]
                              [--color-threshold 0.25] [--min-ratio 0.02]
@@ -445,6 +477,7 @@ import gc
 import heapq
 import json
 import os
+import sqlite3
 import sys
 import time
 import types
@@ -1360,19 +1393,39 @@ def main():
         # _record_candidate — so this is just a final sort for write order.
         conn.execute("DELETE FROM matches")  # matching is fully re-derivable, safe to recompute fresh
         total_stored = 0
+        skipped_stale = 0
         for preview_id, heap in results_by_preview.items():
             for combined_score, candidate_id, res in sorted(heap, key=lambda t: t[0], reverse=True):
-                conn.execute(
-                    """INSERT OR REPLACE INTO matches
-                       (preview_id, candidate_id, visual_score, audio_score, combined_score, scene_matches_json, computed_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (preview_id, candidate_id, res["visual_score"], res["audio_score"],
-                     res["combined_score"], json.dumps(res["scene_matches"]), time.time()),
-                )
-                total_stored += 1
+                # preview_id/candidate_id were resolved against `videos` once, up front
+                # (load_all_scenes/load_all_audio), but a real match run takes minutes —
+                # long enough for a human to prune a missing file via the web UI's
+                # /api/missing-files/prune mid-run. That DELETEs the videos row (and
+                # cascades away any of its existing `matches` rows), but this run's
+                # in-memory results still reference the now-gone id, which trips the
+                # FOREIGN KEY constraint here. Found live: a real ~16.4M-pair run
+                # completed all scoring (932s) only to crash on this exact INSERT,
+                # and — since this whole loop runs in one uncommitted transaction —
+                # rolled back the *entire* run's results, not just the bad row,
+                # wasting the full ~15.5 minutes for zero new matches stored. Skipping
+                # just the stale row instead preserves every other still-valid result.
+                try:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO matches
+                           (preview_id, candidate_id, visual_score, audio_score, combined_score, scene_matches_json, computed_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (preview_id, candidate_id, res["visual_score"], res["audio_score"],
+                         res["combined_score"], json.dumps(res["scene_matches"]), time.time()),
+                    )
+                    total_stored += 1
+                except sqlite3.IntegrityError:
+                    skipped_stale += 1
 
+    if skipped_stale:
+        print(f"  Skipped {skipped_stale} match(es) referencing a video pruned during this run.")
     update_scan_run(args.db, args.run_id, stage_done=len(pairs),
-                     message=f"{total_stored} matches stored", updated_at=time.time())
+                     message=f"{total_stored} matches stored"
+                             + (f" ({skipped_stale} skipped, pruned mid-run)" if skipped_stale else ""),
+                     updated_at=time.time())
     print(f"\nDone in {(time.time()-t0):.1f}s. {total_stored} match rows stored for {len(results_by_preview)} previews with at least one candidate.")
     print("Next: launch the review UI (04_serve.py) to inspect and confirm matches.")
 
